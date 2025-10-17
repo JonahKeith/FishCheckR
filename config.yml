@@ -1,0 +1,19 @@
+# Database connection
+server:
+  host: "pg.wdfw-fish.us"
+  port: 5433
+  database_FISH: "FISH"
+  database_fish: "fish"
+
+users:
+- "zimmercz" #Ryan Z, District 11
+- "sutar477" #Alanna S, District 13
+- "keij1477" #Jonah K, District 14
+- "ando1477" #Olivia A, District 14
+- "dothl477" #Hannah D, District 16
+- "figlakpf" #Kim FB, District 17 N
+- "wite1477" #Erin W, District 17 S
+- "buehrtwb" #Thomas B, admin
+- "bentlktb" #Kale B, admin
+- "booe1477" #Evan B, admin and maintainer
+- "holc2477" #Colt H, admin and maintainer
