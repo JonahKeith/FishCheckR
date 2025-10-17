@@ -32,10 +32,6 @@ library(creelutils)
 ```
 
 ```{r}
-establish_db_con()
-```
-
-```{r}
 con <- establish_db_con()
 
 wdfw_interview <- fetch_db_table(con, "creel", "vw_analysis_interview")
