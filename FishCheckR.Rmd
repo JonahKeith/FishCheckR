@@ -62,7 +62,7 @@ theme_dark_custom <- function() {
 theme_set(theme_dark_custom())
 ```
 
-```{r database-connection, include=FALSE}
+```{r database-connection, echo=FALSE}
 # Database connection with error handling
 tryCatch({
   con <- establish_db_con()
@@ -283,7 +283,6 @@ wdfw_catch %>%
   ) %>%
   create_catch_plot("WDFW Creel Recorded Catch - Last 30 Days", "water_body")
 ```
-```
 
 # Daily Steelhead Catch {data-navmenu="Recorded Catch"}
 ```{r daily-steelhead, echo=FALSE}
@@ -359,8 +358,8 @@ create_comparison_plot(wdfw_catch, "District 16")
 ```
 
 # District 17 South Current vs Previous Year {data-navmenu="Recorded Catch"}
-```{r district-17-south, echo=FALSE}
-create_comparison_plot(wdfw_catch, "District 17 South")
+```{r district-17-south, echo=FALSE, eval=FALSE}
+#create_comparison_plot(wdfw_catch, "District 17 South")
 ```
 
 # District 17 North Current vs Previous Year {data-navmenu="Recorded Catch"}
@@ -374,7 +373,7 @@ create_comparison_plot(wdfw_catch, "Cowlitz")
 ```
 
 # Recorded Catch by Water Body {data-navmenu="Recorded Catch"}
-```{r water-body-interactive, echo=FALSE}
+```{r water-body-interactive, eval=FALSE, include=FALSE}
 water_bodies <- wdfw_catch %>%
   filter(
     event_date > '2022-01-01',
