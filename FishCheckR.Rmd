@@ -65,7 +65,7 @@ theme_set(theme_dark_custom())
 ```{r database-connection, echo=FALSE}
 # Database connection with error handling
 tryCatch({
-  con <- establish_db_con()
+  con <- connect_creel_db()
   
   # Load data tables
   wdfw_interview <- fetch_db_table(con, "creel", "vw_analysis_interview")
