@@ -1,29 +1,27 @@
 ---
 title: "FishCheckR"
-output: 
+output:
   flexdashboard::flex_dashboard:
     theme:
       version: 5
-      bootswatch: darkly  # Changed to dark theme
+      bootswatch: darkly
       base_font:
         google: Prompt
       code_font:
         google: JetBrains Mono
-      bg: "#222222"      # Dark background
-      fg: "#ffffff"      # Light foreground
+      bg: "#222222"
+      fg: "#ffffff"
     orientation: columns
     vertical_layout: fill
 runtime: shiny
 ---
 
 ```{r setup, include=FALSE}
-# Load libraries
 library(shiny)
 library(flexdashboard)
 library(bslib)
 library(htmltools)
-library(httr)       
-library(jsonlite)   
+library(httr)
 library(tidyverse)
 library(lubridate)
 library(hms)
@@ -32,7 +30,24 @@ library(reactable)
 library(plotly)
 library(creelutils)
 
-# Set plotly dark theme for all plots
+# Hyperlinks. Built from pieces so copy/paste can't turn it into a markdown link
+FISH_HOST       <- paste0("https", "://", "apps.wdfw-fish.us")
+CREEL_EVENT_URL <- paste0(FISH_HOST, "/creel/creel_event/")
+
+# Strip any "[url](url)" formatting, keep the plain URL
+clean_url <- function(x) {
+  x <- gsub("\\[[^]]*\\]\\(([^)]*)\\)", "\\1", x)
+  trimws(gsub("[][()\"'<> ]", "", x))
+}
+
+# Open in the Windows default browser (not in R / RStudio)
+open_external <- function(url) {
+  url <- clean_url(url)
+  stopifnot(startsWith(url, CREEL_EVENT_URL))
+  if (.Platform$OS.type == "windows") shell.exec(url) else utils::browseURL(url)
+  invisible(NULL)
+}
+
 plotly_dark_theme <- list(
   plot_bgcolor = "#222222",
   paper_bgcolor = "#222222",
@@ -41,126 +56,491 @@ plotly_dark_theme <- list(
   yaxis = list(gridcolor = "#444444", linecolor = "#666666")
 )
 
-# Set ggplot2 dark theme
 theme_dark_custom <- function() {
   theme_minimal() +
-  theme(
-    plot.background = element_rect(fill = "#222222", color = NA),
-    panel.background = element_rect(fill = "#222222", color = NA),
-    text = element_text(color = "#ffffff"),
-    axis.text = element_text(color = "#cccccc"),
-    strip.background = element_rect(fill = "#333333", color = NA),
-    strip.text = element_text(color = "#ffffff"),
-    panel.grid.major = element_line(color = "#444444"),
-    panel.grid.minor = element_line(color = "#333333"),
-    legend.background = element_rect(fill = "#222222", color = NA)
-  )
+    theme(
+      plot.background = element_rect(fill = "#222222", color = NA),
+      panel.background = element_rect(fill = "#222222", color = NA),
+      text = element_text(color = "#ffffff"),
+      axis.text = element_text(color = "#cccccc"),
+      strip.background = element_rect(fill = "#333333", color = NA),
+      strip.text = element_text(color = "#ffffff"),
+      panel.grid.major = element_line(color = "#444444"),
+      panel.grid.minor = element_line(color = "#333333"),
+      legend.background = element_rect(fill = "#222222", color = NA)
+    )
 }
-
-# Set default theme
 theme_set(theme_dark_custom())
+
+focal_species  <- c("Chinook", "Coho", "Pink", "Steelhead", "Chum", "Sockeye")
+recent_days_30 <- 30
+recent_days_60 <- 60
 ```
 
-```{r database-connection, echo=FALSE}
-# Database connection with error handling
-tryCatch({
-  con <- connect_creel_db()
-  
-  # Load data tables
-  wdfw_interview <- fetch_db_table(con, "creel", "vw_analysis_interview")
-  wdfw_catch <- fetch_db_table(con, "creel", "vw_analysis_catch")
-  wdfw_creel_event <- fetch_db_table(con, "creel", "vw_creel_event")
-  wdfw_effort_count <- fetch_db_table(con, "creel", "vw_analysis_effort_count")
-  
-  # Close connection after fetching
-  if (exists("con")) {
-    DBI::dbDisconnect(con)
-  }
+```{r database-connection, include=FALSE}
+con <- connect_creel_db()
+invisible(shiny::getDefaultReactiveDomain()$onSessionEnded(function() {
+  try(DBI::dbDisconnect(con), silent = TRUE)
+}))
+
+available_fisheries <- tryCatch({
+  lut <- fishery_lut(conn = con)
+  if ("year" %in% names(lut)) lut <- dplyr::arrange(lut, dplyr::desc(year), fishery_name)
+  unique(as.character(lut$fishery_name))
 }, error = function(e) {
-  showNotification(
-    paste("Database connection error:", e$message),
-    type = "error",
-    duration = NULL
-  )
+  creelutils::fetch_fishery_names()
 })
+available_fisheries <- available_fisheries[!is.na(available_fisheries) & nzchar(available_fisheries)]
+
+q_in <- function(col, x) {
+  x <- unique(as.character(x))
+  x <- x[!is.na(x) & nzchar(x)]
+  if (!length(x)) return("FALSE")
+  sprintf("%s %%in%% c(%s)", col, paste(encodeString(x, quote = '"'), collapse = ", "))
+}
+
+prev_fishery_name <- function(x) {
+  vapply(x, function(f) {
+    if (str_detect(f, "\\d{4}-\\d{2}")) {
+      y <- as.integer(str_match(f, "(\\d{4})-\\d{2}")[, 2])
+      str_replace(f, "\\d{4}-\\d{2}", sprintf("%d-%02d", y - 1L, y %% 100L))
+    } else if (str_detect(f, "\\d{4}")) {
+      y <- as.integer(str_extract(f, "\\d{4}"))
+      str_replace(f, "\\d{4}", as.character(y - 1L))
+    } else NA_character_
+  }, character(1), USE.NAMES = FALSE)
+}
 ```
 
 ```{r data-wrangling, include=FALSE}
-# Optimized Data Wrangling Functions
-
-# Function to process dates and times
+# Only *_date and *_time columns are converted; qaqc_datetime is left untouched
 process_datetime <- function(df) {
+  to_date <- function(x) {
+    if (inherits(x, "Date")) {
+      x
+    } else if (inherits(x, "POSIXt")) {
+      as.Date(x)
+    } else {
+      ymd(as.character(x))
+    }
+  }
+
   df %>%
-    mutate(across(contains("date"), ~ymd(.x))) %>%
-    mutate(across(contains("time") & !contains("datetime"), ~as_hms(.x))) %>%
-    mutate(across(contains("datetime"), ~as.Date(.x)))
+    mutate(
+      across(matches("_date$"), to_date),
+      across(matches("_time$"), as_hms)
+    )
 }
 
-# Process WDFW Catch
-wdfw_catch <- wdfw_catch %>% 
-  select(
-    event_date, water_body, fishery_name, project_name,
-    species, run, sex, fate, fork_length_cm, fish_count,
-    life_stage, fish_processing_status, fin_mark, cwt_detection_status,
-    snout_code, cwt_read_status, cwt_code, cwt_species, cwt_run,
-    scale_card_num, scale_card_pos, scale_age_code,
-    pit_detection_status, creel_event_id, interview_id, catch_id
-  ) %>%  
-  mutate(
-    fish_count = as.numeric(fish_count), 
-    fork_length_cm = as.numeric(fork_length_cm)
-  ) %>%
-  process_datetime()
+wrangle_catch <- function(df) {
+  df %>%
+    select(
+      event_date, water_body, fishery_name, project_name,
+      species, run, sex, fate, fork_length_cm, fish_count,
+      life_stage, fish_processing_status, fin_mark, cwt_detection_status,
+      snout_code, cwt_read_status, cwt_code, cwt_species, cwt_run,
+      scale_card_num, scale_card_pos, scale_age_code,
+      pit_detection_status, creel_event_id, interview_id, catch_id
+    ) %>%
+    mutate(
+      fish_count = as.numeric(fish_count),
+      fork_length_cm = as.numeric(fork_length_cm)
+    ) %>%
+    process_datetime()
+}
 
-# Process WDFW Creel Event
-wdfw_creel_event <- wdfw_creel_event %>%
-  rename(water_body = water_body_desc) %>%
-  select(
-    event_date, water_body, project_name, start_time, end_time, 
-    tie_in_indicator, comments_txt, qaqc_datetime, creel_event_id
-  ) %>% 
-  mutate(tie_in_indicator = as.numeric(tie_in_indicator)) %>%
-  process_datetime()
+wrangle_creel_event <- function(df) {
+  df %>%
+    rename(water_body = water_body_desc) %>%
+    select(
+      event_date, water_body, project_name, start_time, end_time,
+      tie_in_indicator, comments_txt, qaqc_datetime, creel_event_id
+    ) %>%
+    mutate(tie_in_indicator = as.numeric(tie_in_indicator)) %>%
+    process_datetime()
+}
 
-# Process WDFW Interview
-wdfw_interview <- wdfw_interview %>% 
-  select(
-    event_date, project_name, fishery_name, water_body, crc_area, fishing_location,
-    section_num, survey_type, surveyor_num, interview_number, trip_status,
-    previously_interviewed, angler_count, total_group_count, vehicle_count,
-    trailer_count, boat_type, boat_used, fishing_start_time, fishing_end_time,
-    interview_time, creel_event_id, interview_id, location_id
-  ) %>% 
-  mutate(across(c(interview_number, total_group_count, vehicle_count,
-                   trailer_count, angler_count), as.numeric)) %>%
-  process_datetime()
+wrangle_interview <- function(df) {
+  df %>%
+    select(
+      event_date, project_name, fishery_name, water_body, crc_area, fishing_location,
+      section_num, survey_type, surveyor_num, interview_number, trip_status,
+      previously_interviewed, angler_count, total_group_count, vehicle_count,
+      trailer_count, boat_type, boat_used, fishing_start_time, fishing_end_time,
+      interview_time, creel_event_id, interview_id, location_id
+    ) %>%
+    mutate(across(c(interview_number, total_group_count, vehicle_count,
+                    trailer_count, angler_count), as.numeric)) %>%
+    process_datetime()
+}
 
-# Process WDFW Effort Count
-wdfw_effort_count <- wdfw_effort_count %>% 
-  select(
-    event_date, project_name, fishery_name, water_body, location,
-    tie_in_indicator, survey_type, count_sequence, section_num,
-    effort_start_time, effort_end_time, count_quantity, count_type,
-    location_type, surveyor_num, comments, p_census_boat, p_census_bank,
-    indirect_census_bank, no_count_reason, creel_event_id, effort_event_id,
-    location_id
-  ) %>% 
-  arrange(event_date, project_name, fishery_name, water_body, location,
-          tie_in_indicator, count_sequence, section_num, effort_start_time) %>% 
-  mutate(across(c(count_quantity, p_census_boat, p_census_bank,
-                  indirect_census_bank), as.numeric)) %>%
-  process_datetime()
+wrangle_effort <- function(df) {
+  df %>%
+    select(
+      event_date, project_name, fishery_name, water_body, location,
+      tie_in_indicator, survey_type, count_sequence, section_num,
+      effort_start_time, effort_end_time, count_quantity, count_type,
+      location_type, surveyor_num, comments, p_census_boat, p_census_bank,
+      indirect_census_bank, no_count_reason, creel_event_id, effort_event_id,
+      location_id
+    ) %>%
+    arrange(event_date, fishery_name, water_body, location,
+            tie_in_indicator, count_sequence, section_num, effort_start_time) %>%
+    mutate(across(c(count_quantity, p_census_boat, p_census_bank,
+                    indirect_census_bank), as.numeric)) %>%
+    process_datetime()
+}
 
-# Create reactive values for caching
-values <- reactiveValues(
-  catch_filtered = NULL,
-  interview_filtered = NULL,
-  effort_filtered = NULL
+sel_fisheries <- reactiveVal(NULL)
+
+observeEvent(input$fishery_go, {
+  req(input$fishery_pick)
+  sel_fisheries(input$fishery_pick)
+}, ignoreInit = TRUE)
+
+# Hyperlink click -> default browser
+observeEvent(input$open_url, {
+  req(is.character(input$open_url), length(input$open_url) == 1)
+  tryCatch(
+    open_external(input$open_url),
+    error = function(e) showNotification(
+      paste("Could not open link:", conditionMessage(e)), type = "error", duration = 10)
+  )
+}, ignoreInit = TRUE)
+
+dat <- reactive({
+  fs <- req(sel_fisheries())
+  withProgress(message = "Querying selected fisheries...", value = 0.1, {
+    flt <- q_in("fishery_name", fs)
+
+    catch     <- fetch_db_table(con, "creel", "vw_analysis_catch", filter = flt)
+    incProgress(0.25)
+    interview <- fetch_db_table(con, "creel", "vw_analysis_interview", filter = flt)
+    incProgress(0.25)
+    effort    <- fetch_db_table(con, "creel", "vw_analysis_effort_count", filter = flt)
+    incProgress(0.2)
+
+    ids <- unique(na.omit(as.character(c(
+      catch$creel_event_id, effort$creel_event_id, interview$creel_event_id
+    ))))
+
+    creel_event <- if (length(ids)) {
+      split(ids, ceiling(seq_along(ids) / 1000)) %>%
+        map(~fetch_db_table(con, "creel", "vw_creel_event",
+                            filter = q_in("creel_event_id", .x))) %>%
+        bind_rows()
+    } else {
+      fetch_db_table(con, "creel", "vw_creel_event", filter = "FALSE")
+    }
+
+    list(
+      catch       = wrangle_catch(catch),
+      interview   = wrangle_interview(interview),
+      effort      = wrangle_effort(effort),
+      creel_event = wrangle_creel_event(creel_event)
+    )
+  })
+})
+
+wdfw_catch        <- reactive(dat()$catch)
+wdfw_interview    <- reactive(dat()$interview)
+wdfw_effort_count <- reactive(dat()$effort)
+wdfw_creel_event  <- reactive(dat()$creel_event)
+
+prev_map <- reactive({
+  tibble(fishery_name = req(sel_fisheries())) %>%
+    mutate(prev_name = prev_fishery_name(fishery_name),
+           prev_name = if_else(prev_name %in% available_fisheries, prev_name, NA_character_))
+})
+
+prev_catch <- reactive({
+  pn <- na.omit(prev_map()$prev_name)
+  if (!length(pn)) return(NULL)
+  wrangle_catch(fetch_db_table(con, "creel", "vw_analysis_catch",
+                               filter = q_in("fishery_name", pn)))
+})
+```
+
+```{r qa-checks, include=FALSE}
+# Each QA check is defined once here and used by both its page and the summary page.
+
+stat_mode <- function(x) {
+  ux <- unique(x)
+  ux[which.max(tabulate(match(x, ux)))]
+}
+
+# Turn "" into NA in text columns (safe for Date/time columns)
+blank_to_na <- function(df) {
+  df %>% mutate(across(where(is.character), ~na_if(trimws(.x), "")))
+}
+
+# ---- Catch ----
+qa_um_chin <- reactive({
+  blank_to_na(wdfw_catch()) %>%
+    mutate(catch_alert = "Unmarked Chinook Kept") %>%
+    select(catch_alert, event_date, project_name, fishery_name, water_body,
+           species, run, fin_mark, cwt_detection_status, fate,
+           fork_length_cm, creel_event_id) %>%
+    filter(species == "Chinook", fate == "Kept", fin_mark == "UM")
+})
+
+qa_cwt_beep <- reactive({
+  wdfw_catch() %>%
+    filter(cwt_detection_status == "CWT + (Beep)") %>%
+    select(event_date, project_name, fishery_name, water_body,
+           species, life_stage, sex, fin_mark, fork_length_cm,
+           cwt_detection_status, snout_code, creel_event_id)
+})
+
+qa_cwt_na_snout <- reactive({
+  blank_to_na(wdfw_catch()) %>%
+    mutate(CWT_Beep_NA_SnoutCode = if_else(
+      cwt_detection_status == "CWT + (Beep)" & is.na(snout_code),
+      "CWT + (Beep) with missing snout code", "Pass")) %>%
+    select(event_date, project_name, fishery_name, water_body,
+           cwt_detection_status, snout_code, cwt_code, species,
+           creel_event_id, CWT_Beep_NA_SnoutCode) %>%
+    filter(CWT_Beep_NA_SnoutCode == "CWT + (Beep) with missing snout code")
+})
+
+qa_cwt_no_beep <- reactive({
+  blank_to_na(wdfw_catch()) %>%
+    mutate(CWT_Neg_with_SnoutCode = if_else(
+      cwt_detection_status == "CWT - (No Beep)" & !is.na(snout_code),
+      "CWT no (Beep) with snout code", "Pass")) %>%
+    select(event_date, project_name, fishery_name, water_body,
+           cwt_detection_status, snout_code, species,
+           creel_event_id, CWT_Neg_with_SnoutCode) %>%
+    filter(CWT_Neg_with_SnoutCode == "CWT no (Beep) with snout code")
+})
+
+# Vectorised (no rowwise) so it also works when zero fish match
+qa_rel_bio <- reactive({
+  blank_to_na(wdfw_catch()) %>%
+    mutate(
+      has_cwt   = cwt_detection_status %in% c("CWT - (No Beep)", "CWT + (Beep)"),
+      has_card  = !is.na(scale_card_num),
+      has_pos   = !is.na(scale_card_pos),
+      has_snout = !is.na(snout_code)
+    ) %>%
+    filter(fate %in% "Released", has_cwt | has_card | has_pos | has_snout) %>%
+    mutate(
+      bio_flag = paste0(
+        if_else(has_cwt,   paste0("; ", cwt_detection_status), ""),
+        if_else(has_card,  "; scale card #",                   ""),
+        if_else(has_pos,   "; scale card position",            ""),
+        if_else(has_snout, "; snout code",                     "")
+      ),
+      bio_flag = sub("^; ", "", bio_flag)
+    ) %>%
+    select(event_date, project_name, fishery_name, water_body,
+           species, fin_mark, fate, cwt_detection_status,
+           scale_card_num, scale_card_pos, snout_code,
+           creel_event_id, bio_flag)
+})
+
+# ---- Interviews ----
+qa_int_1 <- reactive({
+  wdfw_interview() %>%
+    mutate(qc_1_interview = if_else(
+      trip_status == "Incomplete" & !is.na(fishing_end_time),
+      "Incomplete trip status with a fishing end time", "TRUE")) %>%
+    select(event_date, project_name, fishery_name, water_body,
+           interview_number, trip_status, fishing_start_time,
+           fishing_end_time, creel_event_id, qc_1_interview) %>%
+    filter(qc_1_interview == "Incomplete trip status with a fishing end time")
+})
+
+qa_int_2 <- reactive({
+  wdfw_interview() %>%
+    filter(is.na(trip_status)) %>%
+    mutate(qc_2_interview = "missing trip status") %>%
+    select(event_date, project_name, fishery_name, water_body,
+           interview_number, trip_status, fishing_start_time, fishing_end_time,
+           interview_time, creel_event_id, qc_2_interview)
+})
+
+qa_int_3 <- reactive({
+  wdfw_interview() %>%
+    drop_na(fishing_end_time) %>%
+    mutate(qc_3_interview = if_else(
+      fishing_end_time <= interview_time & !is.na(fishing_end_time),
+      "Pass", "fishing end time > interview time")) %>%
+    select(event_date, project_name, fishery_name, water_body,
+           interview_number, trip_status, fishing_start_time, fishing_end_time,
+           interview_time, creel_event_id, qc_3_interview) %>%
+    filter(qc_3_interview == "fishing end time > interview time")
+})
+
+qa_int_4 <- reactive({
+  wdfw_interview() %>%
+    drop_na(fishing_end_time) %>%
+    mutate(qc_4_interview = if_else(
+      fishing_end_time >= fishing_start_time & !is.na(fishing_end_time),
+      "Pass", "fishing start time > fishing end time")) %>%
+    select(event_date, project_name, fishery_name, water_body,
+           interview_number, trip_status, fishing_start_time, fishing_end_time,
+           interview_time, creel_event_id, qc_4_interview) %>%
+    filter(qc_4_interview == "fishing start time > fishing end time")
+})
+
+qa_int_5 <- reactive({
+  wdfw_interview() %>%
+    drop_na(boat_used) %>%
+    mutate(qc_5_interview = if_else(
+      trailer_count <= vehicle_count & !is.na(boat_used),
+      "Pass", "trailer count > vehicle count")) %>%
+    select(event_date, project_name, fishery_name, water_body,
+           interview_number, trailer_count, vehicle_count,
+           creel_event_id, qc_5_interview) %>%
+    filter(qc_5_interview == "trailer count > vehicle count")
+})
+
+qa_int_6 <- reactive({
+  wdfw_interview() %>%
+    drop_na(total_group_count) %>%
+    mutate(qc_6_interview = if_else(
+      angler_count <= total_group_count & !is.na(total_group_count),
+      "Pass", "angler count > total group count")) %>%
+    select(event_date, project_name, fishery_name, water_body,
+           interview_number, vehicle_count, angler_count,
+           total_group_count, creel_event_id, qc_6_interview) %>%
+    filter(qc_6_interview == "angler count > total group count")
+})
+
+qa_int_7 <- reactive({
+  wdfw_interview() %>%
+    drop_na(vehicle_count) %>%
+    mutate(qc_7_interview = if_else(
+      vehicle_count <= total_group_count & !is.na(vehicle_count),
+      "Pass", "vehicle count > group count")) %>%
+    select(event_date, project_name, fishery_name, water_body,
+           interview_number, vehicle_count, angler_count,
+           total_group_count, creel_event_id, qc_7_interview) %>%
+    filter(qc_7_interview == "vehicle count > group count")
+})
+
+qa_int_8 <- reactive({
+  wdfw_interview() %>%
+    filter(is.na(previously_interviewed)) %>%
+    mutate(qc_8_interview = "NA Previously Interviewed") %>%
+    select(event_date, project_name, fishery_name, water_body,
+           interview_number, previously_interviewed, creel_event_id, qc_8_interview)
+})
+
+qa_int_9 <- reactive({
+  wdfw_interview() %>%
+    filter(is.na(fishing_location)) %>%
+    mutate(qc_9_interview = "NA Fishing Location") %>%
+    select(event_date, project_name, fishery_name, water_body,
+           interview_number, fishing_location, creel_event_id, qc_9_interview)
+})
+
+# ---- Effort ----
+qa_eff_1 <- reactive({
+  wdfw_effort_count() %>%
+    filter(tie_in_indicator == FALSE) %>%
+    group_by(project_name, fishery_name, section_num, event_date, creel_event_id, location) %>%
+    summarise(max_cs = max(count_sequence, na.rm = TRUE), .groups = "drop") %>%
+    group_by(fishery_name, section_num, event_date, creel_event_id) %>%
+    mutate(mode_max_cs = stat_mode(max_cs)) %>%
+    ungroup() %>%
+    filter(max_cs < mode_max_cs) %>%
+    mutate(effort_qc_2 = "effort count sequence error") %>%
+    select(event_date, project_name, fishery_name, section_num,
+           location, max_cs, mode_max_cs, creel_event_id, effort_qc_2)
+})
+
+qa_eff_2 <- reactive({
+  wdfw_effort_count() %>%
+    mutate(QC_2_effort = if_else(
+      effort_start_time > effort_end_time & !is.na(count_quantity),
+      "effort start time > effort end time", "Pass")) %>%
+    select(event_date, project_name, fishery_name, water_body,
+           survey_type, location, count_type, effort_start_time,
+           effort_end_time, creel_event_id, QC_2_effort) %>%
+    filter(QC_2_effort == "effort start time > effort end time")
+})
+
+# ---- Creel event ----
+qa_ce_proof <- reactive({
+  wdfw_creel_event() %>%
+    filter(is.na(qaqc_datetime)) %>%
+    mutate(to_be_proofed = "Missing Proof") %>%
+    select(event_date, project_name, water_body, start_time, end_time,
+           tie_in_indicator, comments_txt, qaqc_datetime,
+           creel_event_id, to_be_proofed)
+})
+
+qa_ce_end <- reactive({
+  wdfw_creel_event() %>%
+    filter(is.na(end_time)) %>%
+    mutate(NA_survey_end_time = "NA Survey End Time") %>%
+    select(event_date, project_name, water_body,
+           start_time, end_time, creel_event_id, NA_survey_end_time)
+})
+
+# ---- Registry used by the summary page (page = the {#id} on each page header) ----
+# type = "review" (red/green) or "info" (blue, not counted as needing review)
+qa_checks <- list(
+  list(group = "Catch",       type = "review", name = "UM Chinook kept",                       page = "qa-um-chin",      data = qa_um_chin),
+  list(group = "Catch",       type = "review", name = "Released fish with bio. samples",       page = "qa-rel-bio",      data = qa_rel_bio),
+  list(group = "Catch",       type = "review", name = "CWT + (Beep) with NA snout code",       page = "qa-cwt-na-snout", data = qa_cwt_na_snout),
+  list(group = "Catch",       type = "review", name = "CWT no (Beep) with snout code",         page = "qa-cwt-no-beep",  data = qa_cwt_no_beep),
+  list(group = "Interview",   type = "review", name = "Incomplete trip with fishing end time", page = "qa-int-1",        data = qa_int_1),
+  list(group = "Interview",   type = "review", name = "Missing trip status",                   page = "qa-int-2",        data = qa_int_2),
+  list(group = "Interview",   type = "review", name = "Fishing end time > interview time",     page = "qa-int-3",        data = qa_int_3),
+  list(group = "Interview",   type = "review", name = "Fishing start time > fishing end time", page = "qa-int-4",        data = qa_int_4),
+  list(group = "Interview",   type = "review", name = "Trailer count > vehicle count",         page = "qa-int-5",        data = qa_int_5),
+  list(group = "Interview",   type = "review", name = "Angler count > group count",            page = "qa-int-6",        data = qa_int_6),
+  list(group = "Interview",   type = "review", name = "Vehicle count > group count",           page = "qa-int-7",        data = qa_int_7),
+  list(group = "Interview",   type = "review", name = "NA fishing location",                   page = "qa-int-9",        data = qa_int_9),
+  list(group = "Effort",      type = "review", name = "Effort count sequence",                 page = "qa-eff-1",        data = qa_eff_1),
+  list(group = "Effort",      type = "review", name = "Effort start time > end time",          page = "qa-eff-2",        data = qa_eff_2),
+  list(group = "Creel event", type = "review", name = "Needs proof stamp",                     page = "qa-ce-proof",     data = qa_ce_proof),
+  list(group = "Creel event", type = "review", name = "NA survey end time",                    page = "qa-ce-end",       data = qa_ce_end),
+  list(group = "Info",        type = "info",   name = "All CWT + (Beep)",                      page = "qa-cwt-beep",     data = qa_cwt_beep),
+  list(group = "Info",        type = "info",   name = "NA previously interviewed",             page = "qa-int-8",        data = qa_int_8)
 )
+
+qa_summary <- reactive({
+  shiny::validate(shiny::need(!is.null(sel_fisheries()),
+                              "Pick fishery(s) and click Load data."))
+  map_dfr(qa_checks, function(x) {
+    res <- tryCatch(x$data(), error = function(e) NULL)
+    tibble(
+      group  = x$group,
+      type   = x$type,
+      check  = x$name,
+      page   = x$page,
+      issues = if (is.null(res)) NA_integer_ else nrow(res),
+      events = if (is.null(res) || !"creel_event_id" %in% names(res)) NA_integer_
+               else n_distinct(na.omit(res$creel_event_id))
+    )
+  }) %>%
+    arrange(type == "info",                          # review checks first, info last
+            desc(replace_na(issues, -1L) > 0),       # flagged first
+            desc(issues), group, check)
+})
 ```
 
 ```{r plotting-functions, include=FALSE}
-# Reusable plotting functions
+latest_date <- function(df) {
+  d <- df$event_date
+  if (!length(d) || all(is.na(d))) return(today())
+  max(d, na.rm = TRUE)
+}
+
+daily_x <- function() list(
+  scale_x_date(date_breaks = "1 day", date_labels = "%m/%d", expand = expansion(add = 1)),
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, size = 7))
+)
+
+scroll_box <- function(...) {
+  div(style = "height: calc(100vh - 150px); overflow-y: auto; overflow-x: hidden;", ...)
+}
+
+tall_height <- function(n_rows, per = 320, base = 160) max(650, base + per * n_rows)
 
 create_catch_plot <- function(data, title_text = "", facet_var = NULL) {
   p <- data %>%
@@ -172,14 +552,9 @@ create_catch_plot <- function(data, title_text = "", facet_var = NULL) {
     labs(x = NULL, y = NULL, colour = NULL, subtitle = title_text) +
     theme(
       plot.subtitle = element_text(face = "italic", hjust = 0.5, size = 10),
-      axis.text.x = element_text(angle = 90),
       legend.text = element_text(size = 10)
-    )
-  
-  if (!is.null(facet_var)) {
-    p <- p + facet_wrap(as.formula(paste("~", facet_var)))
-  }
-  
+    ) + daily_x()
+  if (!is.null(facet_var)) p <- p + facet_wrap(as.formula(paste("~", facet_var)))
   ggplotly(p) %>% layout(plotly_dark_theme)
 }
 
@@ -192,62 +567,89 @@ create_bar_plot <- function(data, title_text = "", facet_var = NULL) {
     labs(x = NULL, y = "Total Catch", fill = NULL, subtitle = title_text) +
     theme(
       plot.subtitle = element_text(face = "italic", hjust = 0.5, size = 8),
-      axis.text.x = element_text(size = 8, angle = 90),
       legend.text = element_text(size = 8)
-    )
-  
-  if (!is.null(facet_var)) {
-    p <- p + facet_wrap(as.formula(paste("~", facet_var)))
-  }
-  
+    ) + daily_x()
+  if (!is.null(facet_var)) p <- p + facet_wrap(as.formula(paste("~", facet_var)))
   ggplotly(p) %>% layout(plotly_dark_theme)
 }
 
-create_comparison_plot <- function(data, district_name) {
-  current_year <- year(today())
-  previous_year <- current_year - 1
-  
-  data %>%
-    filter(
-      project_name %in% district_name,
-      year(event_date) %in% c(current_year, previous_year),
-      fate %in% c("Released", "Kept"),
-      species %in% c("Chinook", "Coho", "Pink", "Steelhead", "Chum", "Sockeye")
-    ) %>%
+# Monthly bubbles: months on x, species on y, rivers as rows, prev vs current as columns
+create_comparison_plot <- function(cur, prev, fishery, prev_name) {
+  if (length(prev_name) != 1L) prev_name <- NA_character_
+  periods <- unique(na.omit(c(prev_name, fishery)))
+
+  d <- bind_rows(cur, prev) %>%
+    filter(fishery_name %in% periods, fate %in% c("Kept", "Released"),
+           species %in% focal_species, !is.na(event_date)) %>%
+    mutate(water_body = replace_na(na_if(as.character(water_body), ""), "Not recorded"),
+           period     = factor(fishery_name, levels = periods),
+           month_num  = month(event_date))
+  shiny::validate(shiny::need(nrow(d) > 0, paste("No recorded catch for", fishery)))
+
+  start_m  <- month(min(d$event_date))
+  m_levels <- month.abb[((start_m - 1 + 0:11) %% 12) + 1]
+
+  d <- d %>%
+    group_by(water_body, period, month_num, species, fate) %>%
+    summarise(total_count = sum(fish_count, na.rm = TRUE), .groups = "drop") %>%
+    filter(total_count > 0) %>%
     mutate(
-      year_label = factor(year(event_date), levels = c(previous_year, current_year)),
-      month_label = factor(month(event_date, label = TRUE), levels = month.abb)
-    ) %>%
-    group_by(water_body, year_label, species, month_label, fate) %>%
-    summarize(total_count = sum(fish_count, na.rm = TRUE), .groups = 'drop') %>%
-    ggplot(aes(x = species, y = month_label, size = total_count, color = fate)) +
-    geom_point(alpha = 0.6, position = position_dodge(width = 0.5)) +
+      month_label = factor(month.abb[month_num], levels = m_levels),
+      hover = paste0(
+        "Fishery: ", period,
+        "<br>River: ", water_body,
+        "<br>Month: ", month.name[month_num],
+        "<br>Species: ", species,
+        "<br>Fate: ", fate,
+        "<br>Fish: ", format(total_count, big.mark = ",")
+      )
+    )
+  shiny::validate(shiny::need(nrow(d) > 0, paste("No recorded catch for", fishery)))
+
+  p <- ggplot(d, aes(month_label, species, size = total_count, color = fate, text = hover)) +
+    geom_point(alpha = 0.75, position = position_dodge(width = 0.6)) +
     scale_color_manual(values = c("Kept" = "#ff6b6b", "Released" = "#4ecdc4")) +
-    scale_size_continuous(range = c(1, 15), name = "Count") +
-    coord_flip() +
-    theme_dark_custom() +
-    labs(
-      x = NULL, y = NULL, color = NULL,
-      subtitle = paste0(district_name, ": ", previous_year, " vs ", current_year)
-    ) +
-    theme(
-      plot.subtitle = element_text(face = "italic", hjust = 0.5, size = 8),
-      axis.text = element_text(size = 8)
-    ) +
-    facet_grid(water_body ~ year_label, scales = "free_y", space = "free_y") -> p
-  
-  ggplotly(p) %>% layout(plotly_dark_theme)
+    scale_size_area(max_size = 14, name = "Monthly count") +
+    scale_x_discrete(drop = TRUE) +
+    facet_grid(water_body ~ period) +
+    labs(x = NULL, y = NULL, color = NULL,
+         subtitle = if (is.na(prev_name)) paste0(fishery, " (no previous-year fishery found)")
+                    else paste0(prev_name, " vs ", fishery)) +
+    theme(axis.text.x = element_text(size = 10))
+
+  ggplotly(p, tooltip = "text") %>%
+    layout(plotly_dark_theme, margin = list(l = 80, r = 100, b = 70, t = 60))
 }
 
-# DT table with dark theme
+# creel_event_id -> clickable link; click is sent to R, which opens the default browser
+qaqc_prep <- function(df) {
+  if ("event_date" %in% names(df)) df <- df %>% arrange(desc(event_date), desc(creel_event_id))
+  if ("creel_event_id" %in% names(df)) {
+    df <- df %>% mutate(creel_event_id = as.character(creel_event_id),
+      creel_event_id = if_else(is.na(creel_event_id), NA_character_,
+        sprintf('<a href="#" class="creel-link" data-url="%s%s" style="color:#64b5f6; text-decoration:underline;">%s</a>',
+                CREEL_EVENT_URL, creel_event_id, creel_event_id)))
+  }
+  df
+}
+
 dt_dark <- function(data) {
+  data <- qaqc_prep(data)
+  esc <- if ("creel_event_id" %in% names(data)) {
+    which(names(data) != "creel_event_id")
+  } else TRUE
   datatable(
     data,
     filter = 'top',
+    escape = esc,
+    rownames = FALSE,
     extensions = 'Buttons',
     options = list(
       dom = 'Brtip',
+      pageLength = 50,
       buttons = c('copy', 'csv'),
+      order = list(),
+      language = list(emptyTable = "No issues found for the selected fisheries"),
       initComplete = JS(
         "function(settings, json) {",
         "$('body').css({'background-color': '#222222', 'color': '#ffffff'});",
@@ -256,624 +658,488 @@ dt_dark <- function(data) {
       )
     )
   ) %>%
-    formatStyle(
-      columns = 1:ncol(data),
-      backgroundColor = '#222222',
-      color = '#ffffff'
-    )
+    formatStyle(columns = 1:ncol(data), backgroundColor = '#222222', color = '#ffffff')
 }
+
+dark_reactable_theme <- reactableTheme(
+  color = "#ffffff", backgroundColor = "#222222", borderColor = "#444444",
+  stripedColor = "#2a2a2a", highlightColor = "#333333",
+  inputStyle = list(backgroundColor = "#333333", color = "#ffffff"),
+  selectStyle = list(backgroundColor = "#333333", color = "#ffffff"),
+  paginationStyle = list(color = "#ffffff", fontSize = "15px", padding = "10px",
+                         borderTop = "1px solid #666666"),
+  pageButtonStyle = list(backgroundColor = "#3b3b3b", color = "#ffffff",
+                         border = "1px solid #888888", minWidth = "38px", padding = "6px 10px"),
+  pageButtonHoverStyle = list(backgroundColor = "#555555"),
+  pageButtonCurrentStyle = list(backgroundColor = "#375a7f", fontWeight = "bold")
+)
+```
+
+# Sidebar {.sidebar}
+
+```{r sidebar-controls, echo=FALSE}
+# Button sits above the picker so the open drop-down never covers it
+div(style = "margin-bottom: 12px;",
+    actionButton("fishery_go", "Load data", class = "btn-primary",
+                 icon = icon("fish"), width = "100%"))
+
+selectizeInput(
+  "fishery_pick", "Fishery(s)",
+  choices = available_fisheries, multiple = TRUE,
+  options = list(placeholder = "Type to search...",
+                 plugins = list("remove_button"))
+)
+
+tags$style(HTML("
+.dataTables_wrapper .dataTables_paginate .paginate_button,
+.dataTables_wrapper .dataTables_info { color:#fff !important; }
+.dataTables_wrapper .page-link { background:#3b3b3b; color:#fff; border-color:#888; }
+.dataTables_wrapper .page-item.active .page-link { background:#375a7f; border-color:#fff; }
+.chart-stage { overflow-y: auto !important; }
+"))
+
+tags$script(HTML("
+$(document)
+  .off('click.fishcheck', 'a.creel-link')
+  .on('click.fishcheck', 'a.creel-link', function(e) {
+    e.preventDefault();
+    Shiny.setInputValue('open_url', $(this).attr('data-url'), {priority: 'event'});
+  });
+
+// Jump to a dashboard page by its {#id}
+window.fishcheckGoTo = function(id) {
+  var a = $('.navbar a').filter(function() {
+    var h = $(this).attr('href') || '';
+    return h.slice(-(id.length + 1)) === '#' + id || h.slice(-(id.length + 1)) === '-' + id;
+  });
+  if (a.length) { a.click(); } else { window.location.hash = id; }
+};
+"))
 ```
 
 # WDFW Creel {data-icon="fa-home"}
-```{r home-page, echo=FALSE, fig.cap="", out.width = '100%'}
-# Note: Replace "SkagitAerial.jpg" with your actual image
-# For dark mode, you might want to adjust image brightness
-knitr::include_graphics("SkagitAerial.jpg")
+
+```{r home-page, echo=FALSE, out.width='100%'}
+if (file.exists("SkagitAerial.jpg")) knitr::include_graphics("SkagitAerial.jpg")
 ```
 
-# Catch By River {data-navmenu="Recorded Catch"}
-```{r last-30-days, echo=FALSE}
-wdfw_catch %>% 
-  uncount(fish_count) %>%  
-  filter(
-    event_date >= today() - days(30),
-    fate %in% c("Kept", "Released"),
-    species %in% c("Chinook", "Coho", "Pink", "Steelhead", "Chum", "Sockeye")
-  ) %>%
-  create_catch_plot("WDFW Creel Recorded Catch - Last 30 Days", "water_body")
-```
+# QA/QC Summary {#qa-summary data-icon="fa-clipboard-check"}
 
-# Daily Steelhead Catch {data-navmenu="Recorded Catch"}
-```{r daily-steelhead, echo=FALSE}
-wdfw_catch %>% 
-  filter(
-    event_date >= today() - days(60),
-    fate %in% c("Kept", "Released"),
-    species == "Steelhead"
-  ) %>% 
-  group_by(fishery_name, event_date, species, fate) %>% 
-  summarize(total_catch = sum(fish_count, na.rm = TRUE), .groups = 'drop') %>%
-  create_bar_plot("WDFW Creel - Steelhead Daily Catch", "fishery_name")
-```
+```{r qa-summary-page, echo=FALSE}
+renderUI({
+  s <- qa_summary()
+  r <- s %>% filter(type == "review")
+  flagged <- sum(r$issues > 0, na.rm = TRUE)
+  errors  <- sum(is.na(s$issues))
+  div(style = "padding: 6px 4px 12px 4px; font-size: 16px;",
+      tags$b(sprintf("%d of %d checks need review", flagged, nrow(r))),
+      sprintf(" · %s total issues", format(sum(r$issues, na.rm = TRUE), big.mark = ",")),
+      if (errors > 0) tags$span(style = "color:#bbbbbb;",
+                                sprintf(" · %d check(s) failed to run", errors)),
+      tags$div(style = "font-size: 13px; color:#bbbbbb; margin-top: 4px;",
+               "Click a row to open that check. Blue = info only (not counted as issues)."))
+})
 
-# Daily Chinook Catch {data-navmenu="Recorded Catch"}
-```{r daily-chinook, echo=FALSE}
-wdfw_catch %>% 
-  filter(
-    event_date >= today() - days(60),
-    fate %in% c("Kept", "Released"),
-    species == "Chinook"
-  ) %>% 
-  group_by(fishery_name, event_date, species, fate) %>% 
-  summarize(total_catch = sum(fish_count, na.rm = TRUE), .groups = 'drop') %>%
-  create_bar_plot("WDFW Creel - Chinook Daily Catch", "fishery_name")
-```
-
-# Current Year Catch by Fishery {data-navmenu="Recorded Catch"}
-```{r current-year-catch, echo=FALSE}
-current_year <- year(today())
-
-wdfw_catch %>%
-  filter(
-    event_date >= as.Date(paste0(current_year, "-01-01")),
-    fate %in% c("Kept", "Released"),
-    species %in% c("Chinook", "Coho", "Chum", "Sockeye", "Pink", "Steelhead"),
-    !is.na(fish_count)
-  ) %>%
-  group_by(project_name, fishery_name, water_body, species, fate) %>%
-  summarize(total_catch = sum(fish_count, na.rm = TRUE), .groups = 'drop') %>%
-  ggplot(aes(x = total_catch, y = species, fill = fate)) +
-  scale_x_continuous(expand = c(0, 0), limits = c(0, NA)) +
-  geom_col() +
-  scale_fill_manual(values = c("Kept" = "#ff6b6b", "Released" = "#4ecdc4")) +
-  theme_dark_custom() +
-  labs(
-    x = NULL, y = NULL, fill = NULL,
-    subtitle = paste0("WDFW Creel ", current_year, " - Total Recorded Catch by Fishery")
-  ) +
-  facet_wrap(~ fishery_name) -> p
-
-ggplotly(p) %>% layout(plotly_dark_theme)
-```
-
-# District 11 Current vs Previous Year {data-navmenu="Recorded Catch"}
-```{r district-11, echo=FALSE}
-create_comparison_plot(wdfw_catch, "District 11")
-```
-
-# District 13 Current vs Previous Year {data-navmenu="Recorded Catch"}
-```{r district-13, echo=FALSE}
-create_comparison_plot(wdfw_catch, "District 13")
-```
-
-# District 14 Current vs Previous Year {data-navmenu="Recorded Catch"}
-```{r district-14, echo=FALSE}
-create_comparison_plot(wdfw_catch, "District 14")
-```
-
-# District 16 Current vs Previous Year {data-navmenu="Recorded Catch"}
-```{r district-16, echo=FALSE}
-create_comparison_plot(wdfw_catch, "District 16")
-```
-
-# District 17 South Current vs Previous Year {data-navmenu="Recorded Catch"}
-```{r district-17-south, echo=FALSE, eval=FALSE}
-#create_comparison_plot(wdfw_catch, "District 17 South")
-```
-
-# District 17 North Current vs Previous Year {data-navmenu="Recorded Catch"}
-```{r district-17-north, echo=FALSE}
-create_comparison_plot(wdfw_catch, "District 17 North")
-```
-
-# Cowlitz Current vs Previous Year {data-navmenu="Recorded Catch"}
-```{r cowlitz, echo=FALSE}
-create_comparison_plot(wdfw_catch, "Cowlitz")
-```
-
-# Recorded Catch by Water Body {data-navmenu="Recorded Catch"}
-```{r water-body-interactive, eval=FALSE, include=FALSE}
-water_bodies <- wdfw_catch %>%
-  filter(
-    event_date > '2022-01-01',
-    fate %in% c("Released", "Kept"),
-    species %in% c("Chinook", "Coho", "Pink", "Steelhead", "Chum", "Sockeye")
-  ) %>%
-  pull(water_body) %>%
-  unique() %>%
-  sort()
-
-# Create select input
-selectInput(
-  inputId = "water_body_select",
-  label = "Select Water Body:",
-  choices = c("All Water Bodies" = "all", water_bodies),
-  selected = "all",
-  multiple = FALSE
-)
-
-# Reactive plot with caching
-renderPlotly({
-  # Use reactive caching
-  filtered_data <- reactive({
-    data <- wdfw_catch %>%
-      uncount(fish_count) %>%
-      filter(
-        event_date > '2022-01-01',
-        fate %in% c("Released", "Kept"),
-        species %in% c("Chinook", "Coho", "Pink", "Steelhead", "Chum", "Sockeye")
+renderReactable({
+  s <- qa_summary()
+  reactable(
+    s,
+    filterable = TRUE, outlined = TRUE, highlight = TRUE, resizable = TRUE,
+    pagination = FALSE,
+    theme = dark_reactable_theme,
+    rowStyle = list(cursor = "pointer"),
+    onClick = JS("function(rowInfo) { window.fishcheckGoTo(rowInfo.row.page); }"),
+    columns = list(
+      group  = colDef(name = "Group", minWidth = 110),
+      check  = colDef(name = "Check", minWidth = 280),
+      type   = colDef(show = FALSE),
+      page   = colDef(show = FALSE),
+      issues = colDef(
+        name = "Count", align = "center", maxWidth = 110,
+        cell = function(v) if (is.na(v)) "error" else format(v, big.mark = ","),
+        style = function(v, index) {
+          bg <- if (is.na(v)) "#666666"
+                else if (s$type[index] == "info") "#375a7f"
+                else if (v == 0) "#2e7d32"
+                else "#c62828"
+          list(background = bg, color = "#ffffff", fontWeight = "bold")
+        }
+      ),
+      events = colDef(
+        name = "Creel events", align = "center", maxWidth = 130,
+        cell = function(v) if (is.na(v)) "" else format(v, big.mark = ",")
       )
-    
-    if (input$water_body_select != "all") {
-      data <- data %>% filter(water_body == input$water_body_select)
-    }
-    data
-  })
-  
-  # Create plot
-  p <- filtered_data() %>%
-    ggplot(aes(x = event_date, y = species, color = fate)) +
-    geom_point(alpha = 0.8) +
-    scale_color_manual(values = c("Kept" = "#ff6b6b", "Released" = "#4ecdc4")) +
-    geom_jitter(width = 0.3, height = 0.1) +
+    )
+  )
+})
+```
+
+# Catch Last 30 Days {data-navmenu="Raw Catch Plots"}
+
+```{r last-30-days, echo=FALSE}
+renderPlotly({
+  d <- wdfw_catch()
+  d %>%
+    uncount(fish_count) %>%
+    filter(
+      event_date >= latest_date(d) - days(recent_days_30),
+      fate %in% c("Kept", "Released"),
+      species %in% focal_species
+    ) %>%
+    create_catch_plot(paste0("WDFW Creel Recorded Catch - Last ", recent_days_30,
+                             " Days of Selected Fisheries"), "fishery_name")
+})
+```
+
+# Daily Steelhead Catch {data-navmenu="Raw Catch Plots"}
+
+```{r daily-steelhead, echo=FALSE}
+renderPlotly({
+  d <- wdfw_catch()
+  d %>%
+    filter(
+      event_date >= latest_date(d) - days(recent_days_60),
+      fate %in% c("Kept", "Released"),
+      species == "Steelhead"
+    ) %>%
+    group_by(fishery_name, event_date, species, fate) %>%
+    summarize(total_catch = sum(fish_count, na.rm = TRUE), .groups = 'drop') %>%
+    create_bar_plot("WDFW Creel - Steelhead Daily Catch", "fishery_name")
+})
+```
+
+# Daily Chinook Catch {data-navmenu="Raw Catch Plots"}
+
+```{r daily-chinook, echo=FALSE}
+renderPlotly({
+  d <- wdfw_catch()
+  d %>%
+    filter(
+      event_date >= latest_date(d) - days(recent_days_60),
+      fate %in% c("Kept", "Released"),
+      species == "Chinook"
+    ) %>%
+    group_by(fishery_name, event_date, species, fate) %>%
+    summarize(total_catch = sum(fish_count, na.rm = TRUE), .groups = 'drop') %>%
+    create_bar_plot("WDFW Creel - Chinook Daily Catch", "fishery_name")
+})
+```
+
+# Total Catch by Fishery {data-navmenu="Raw Catch Plots"}
+
+```{r total-catch, echo=FALSE}
+renderPlotly({
+  p <- wdfw_catch() %>%
+    filter(
+      fate %in% c("Kept", "Released"),
+      species %in% focal_species,
+      !is.na(fish_count)
+    ) %>%
+    group_by(fishery_name, species, fate) %>%
+    summarize(total_catch = sum(fish_count, na.rm = TRUE), .groups = 'drop') %>%
+    ggplot(aes(x = total_catch, y = species, fill = fate)) +
+    scale_x_continuous(expand = c(0, 0), limits = c(0, NA)) +
+    geom_col() +
+    scale_fill_manual(values = c("Kept" = "#ff6b6b", "Released" = "#4ecdc4")) +
     theme_dark_custom() +
-    labs(x = NULL, y = NULL, colour = NULL, subtitle = "WDFW Creel - Recorded Catch")
-  
-  if (input$water_body_select == "all") {
-    p <- p + facet_wrap(~water_body)
-  }
-  
+    labs(x = NULL, y = NULL, fill = NULL,
+         subtitle = "WDFW Creel - Total Recorded Catch by Fishery") +
+    facet_wrap(~ fishery_name)
   ggplotly(p) %>% layout(plotly_dark_theme)
 })
 ```
 
-# UM Chin Kept * excluding fall run {data-navmenu="Catch QA_QC"}
+# Daily Catch By River {data-navmenu="Raw Catch Plots"}
+
+```{r catch-by-river, echo=FALSE}
+output$river_container <- renderUI({
+  n <- n_distinct(na.omit(wdfw_catch()$water_body))
+  scroll_box(plotlyOutput("river_plot", height = paste0(tall_height(ceiling(n / 2), per = 300), "px")))
+})
+
+output$river_plot <- renderPlotly({
+  d <- wdfw_catch() %>%
+    filter(!is.na(event_date), !is.na(water_body),
+           fate %in% c("Kept", "Released"), species %in% focal_species) %>%
+    group_by(water_body, event_date, species, fate) %>%
+    summarise(total_count = sum(fish_count, na.rm = TRUE), .groups = "drop") %>%
+    filter(total_count > 0)
+  shiny::validate(shiny::need(nrow(d) > 0, "No recorded catch for the selected fisheries."))
+  p <- ggplot(d, aes(event_date, species, size = total_count, color = fate)) +
+    geom_point(alpha = 0.75) +
+    scale_color_manual(values = c("Kept" = "#ff6b6b", "Released" = "#4ecdc4")) +
+    scale_size_area(max_size = 12, name = "Fish") +
+    facet_wrap(~ water_body, ncol = 2) +
+    labs(x = NULL, y = NULL, color = NULL, subtitle = "Recorded catch by river") +
+    daily_x()
+  ggplotly(p) %>% layout(plotly_dark_theme)
+})
+
+uiOutput("river_container")
+```
+
+# Total Catch By River {data-navmenu="Raw Catch Plots"}
+
+```{r catch-by-river-total, echo=FALSE}
+renderPlotly({
+  p <- wdfw_catch() %>%
+    filter(fate %in% c("Kept", "Released"), species %in% focal_species, !is.na(fish_count)) %>%
+    group_by(water_body, species, fate) %>%
+    summarise(total_catch = sum(fish_count, na.rm = TRUE), .groups = "drop") %>%
+    ggplot(aes(total_catch, species, fill = fate)) +
+    geom_col() +
+    scale_x_continuous(expand = c(0, 0), limits = c(0, NA)) +
+    scale_fill_manual(values = c("Kept" = "#ff6b6b", "Released" = "#4ecdc4")) +
+    labs(x = NULL, y = NULL, fill = NULL, subtitle = "Total recorded catch by river") +
+    facet_wrap(~ water_body)
+  ggplotly(p) %>% layout(plotly_dark_theme)
+})
+```
+
+# Current vs Previous Year {data-navmenu="Raw Catch Plots"}
+
+```{r current-vs-previous, echo=FALSE}
+output$cvp_controls <- renderUI(
+  selectInput("cvp_fishery", "Fishery:", choices = req(sel_fisheries()))
+)
+
+cvp_data <- reactive({
+  fn <- req(input$cvp_fishery)
+  req(fn %in% sel_fisheries())
+  pm <- prev_map()
+  pn <- pm$prev_name[match(fn, pm$fishery_name)]
+  cur <- wdfw_catch() %>% filter(fishery_name == fn)
+  prv <- if (!is.na(pn) && !is.null(prev_catch())) prev_catch() %>% filter(fishery_name == pn) else NULL
+  list(cur = cur, prv = prv, fn = fn, pn = pn)
+})
+
+output$cvp_container <- renderUI({
+  x <- cvp_data()
+  n <- n_distinct(na.omit(bind_rows(x$cur, x$prv)$water_body))
+  scroll_box(plotlyOutput("cvp_plot", height = paste0(tall_height(n), "px")))
+})
+
+output$cvp_plot <- renderPlotly({
+  x <- cvp_data()
+  create_comparison_plot(x$cur, x$prv, x$fn, x$pn)
+})
+
+uiOutput("cvp_controls")
+uiOutput("cvp_container")
+```
+
+# UM Chin Kept {#qa-um-chin data-navmenu="Catch QA_QC"}
+
 ```{r um-chin-kept, echo=FALSE}
-catch_alert_1 <- wdfw_catch
-catch_alert_1[catch_alert_1 == ""] <- NA
-catch_alert_1 %>%
-  mutate(catch_alert = "Unmarked Chinook Kept") %>%
-  select(
-    catch_alert, event_date, project_name, fishery_name, water_body,
-    species, run, fin_mark, cwt_detection_status, fate,
-    fork_length_cm, creel_event_id
-  ) %>%
-  filter(
-    species == "Chinook",
-    fate == "Kept",
-    fin_mark == "UM",
-    run %in% c(NA, "Spring", "Summer")
-  ) %>%
-  dt_dark()
+renderDT(dt_dark(qa_um_chin()))
 ```
 
-# All CWT + (Beep) {data-navmenu="Catch QA_QC"}
+# All CWT + (Beep) {#qa-cwt-beep data-navmenu="Catch QA_QC"}
+
 ```{r cwt-beep, echo=FALSE}
-wdfw_catch %>% 
-  filter(cwt_detection_status == "CWT + (Beep)") %>%
-  select(
-    event_date, project_name, water_body,
-    species, life_stage, sex, fin_mark, fork_length_cm,
-    cwt_detection_status, snout_code, creel_event_id
-  ) %>%
-  dt_dark()
+renderDT(dt_dark(qa_cwt_beep()))
 ```
 
-# CWT + (Beep) NA Snout Code {data-navmenu="Catch QA_QC"}
+# CWT + (Beep) NA Snout Code {#qa-cwt-na-snout data-navmenu="Catch QA_QC"}
+
 ```{r cwt-na-snout, echo=FALSE}
-CWT_positive_with_NA_snout_code <- wdfw_catch
-CWT_positive_with_NA_snout_code[CWT_positive_with_NA_snout_code == ""] <- NA
-CWT_positive_with_NA_snout_code %>%
-  mutate(
-    CWT_Beep_NA_SnoutCode = if_else(
-      cwt_detection_status == "CWT + (Beep)" & is.na(snout_code),
-      "CWT + (Beep) with missing snout code", "Pass"
-    )
-  ) %>%
-  select(
-    event_date, project_name, fishery_name, water_body,
-    cwt_detection_status, snout_code, cwt_code, species,
-    creel_event_id, CWT_Beep_NA_SnoutCode
-  ) %>%
-  filter(CWT_Beep_NA_SnoutCode == "CWT + (Beep) with missing snout code") %>%
-  dt_dark()
+renderDT(dt_dark(qa_cwt_na_snout()))
 ```
 
-# CWT no (Beep) with Snout Code {data-navmenu="Catch QA_QC"}
+# CWT no (Beep) with Snout Code {#qa-cwt-no-beep data-navmenu="Catch QA_QC"}
+
 ```{r cwt-no-beep, echo=FALSE}
-wdfw_catch %>%
-  mutate(
-    CWT_Neg_with_SnoutCode = if_else(
-      cwt_detection_status == "CWT - (No Beep)" & !is.na(snout_code),
-      "CWT no (Beep) with snout code", "Pass"
-    )
-  ) %>%
-  select(
-    event_date, project_name, fishery_name, water_body,
-    cwt_detection_status, snout_code, species,
-    creel_event_id, CWT_Neg_with_SnoutCode
-  ) %>%
-  filter(CWT_Neg_with_SnoutCode == "CWT no (Beep) with snout code") %>%
-  dt_dark()
+renderDT(dt_dark(qa_cwt_no_beep()))
 ```
 
-# Incomplete Trip Status with Fishing End Time {data-navmenu="Interviews QA_QC"}
+# Released fish with Bio. samples {#qa-rel-bio data-navmenu="Catch QA_QC"}
+
+```{r released-bio, echo=FALSE}
+renderDT(dt_dark(qa_rel_bio()))
+```
+
+# Incomplete Trip Status with Fishing End Time {#qa-int-1 data-navmenu="Interviews QA_QC"}
+
 ```{r interview-qc1, echo=FALSE}
-wdfw_interview %>%
-  filter(event_date > '2020-01-01') %>%
-  mutate(
-    qc_1_interview = if_else(
-      trip_status == "Incomplete" & !is.na(fishing_end_time),
-      "Incomplete trip status with a fishing end time", "TRUE"
-    )
-  ) %>%
-  select(
-    event_date, project_name, fishery_name, water_body,
-    interview_number, trip_status, fishing_start_time,
-    fishing_end_time, creel_event_id, qc_1_interview
-  ) %>%
-  filter(qc_1_interview == "Incomplete trip status with a fishing end time") %>%
-  dt_dark()
+renderDT(dt_dark(qa_int_1()))
 ```
 
-# Missing Trip Status {data-navmenu="Interviews QA_QC"}
+# Missing Trip Status {#qa-int-2 data-navmenu="Interviews QA_QC"}
+
 ```{r interview-qc2, echo=FALSE}
-wdfw_interview %>%
-  filter(
-    event_date > '2020-01-01',
-    is.na(trip_status)
-  ) %>%
-  mutate(qc_2_interview = "missing trip status") %>%
-  select(
-    event_date, project_name, fishery_name, water_body,
-    interview_number, trip_status, fishing_start_time, fishing_end_time,
-    interview_time, creel_event_id, qc_2_interview
-  ) %>%
-  dt_dark()
+renderDT(dt_dark(qa_int_2()))
 ```
 
-# Fishing End Time > Interview Time {data-navmenu="Interviews QA_QC"}
+# Fishing End Time > Interview Time {#qa-int-3 data-navmenu="Interviews QA_QC"}
+
 ```{r interview-qc3, echo=FALSE}
-wdfw_interview %>%
-  filter(event_date > '2020-01-01') %>%
-  drop_na(fishing_end_time) %>%
-  mutate(
-    qc_3_interview = if_else(
-      fishing_end_time <= interview_time & !is.na(fishing_end_time),
-      "Pass", "fishing end time > interview time"
-    )
-  ) %>%
-  select(
-    event_date, project_name, fishery_name, water_body,
-    interview_number, trip_status, fishing_start_time, fishing_end_time,
-    interview_time, creel_event_id, qc_3_interview
-  ) %>%
-  filter(qc_3_interview == "fishing end time > interview time") %>%
-  dt_dark()
+renderDT(dt_dark(qa_int_3()))
 ```
 
-# Fishing Start Time > Fishing End Time {data-navmenu="Interviews QA_QC"}
+# Fishing Start Time > Fishing End Time {#qa-int-4 data-navmenu="Interviews QA_QC"}
+
 ```{r interview-qc4, echo=FALSE}
-wdfw_interview %>%
-  filter(event_date > '2020-01-01') %>%
-  drop_na(fishing_end_time) %>%
-  mutate(
-    qc_4_interview = if_else(
-      fishing_end_time >= fishing_start_time & !is.na(fishing_end_time),
-      "Pass", "fishing start time > fishing end time"
-    )
-  ) %>%
-  select(
-    event_date, project_name, fishery_name, water_body,
-    interview_number, trip_status, fishing_start_time, fishing_end_time,
-    interview_time, creel_event_id, qc_4_interview
-  ) %>%
-  filter(qc_4_interview == "fishing start time > fishing end time") %>%
-  dt_dark()
+renderDT(dt_dark(qa_int_4()))
 ```
 
-# Trailer Count > Vehicle Count {data-navmenu="Interviews QA_QC"}
+# Trailer Count > Vehicle Count {#qa-int-5 data-navmenu="Interviews QA_QC"}
+
 ```{r interview-qc5, echo=FALSE}
-wdfw_interview %>%
-  filter(event_date > '2020-01-01') %>%
-  drop_na(boat_used) %>%
-  mutate(
-    qc_5_interview = if_else(
-      trailer_count <= vehicle_count & !is.na(boat_used),
-      "Pass", "trailer count > vehicle count"
-    )
-  ) %>%
-  select(
-    event_date, project_name, fishery_name, water_body,
-    interview_number, trailer_count, vehicle_count,
-    creel_event_id, qc_5_interview
-  ) %>%
-  filter(qc_5_interview == "trailer count > vehicle count") %>%
-  dt_dark()
+renderDT(dt_dark(qa_int_5()))
 ```
 
-# Angler Count > Group Count {data-navmenu="Interviews QA_QC"}
+# Angler Count > Group Count {#qa-int-6 data-navmenu="Interviews QA_QC"}
+
 ```{r interview-qc6, echo=FALSE}
-wdfw_interview %>%
-  filter(event_date > '2020-01-01') %>%
-  drop_na(total_group_count) %>%
-  mutate(
-    qc_6_interview = if_else(
-      angler_count <= total_group_count & !is.na(total_group_count),
-      "Pass", "angler count > total group count"
-    )
-  ) %>%
-  select(
-    event_date, project_name, fishery_name, water_body,
-    interview_number, vehicle_count, angler_count,
-    total_group_count, creel_event_id, qc_6_interview
-  ) %>%
-  filter(qc_6_interview == "angler count > total group count") %>%
-  dt_dark()
+renderDT(dt_dark(qa_int_6()))
 ```
 
-# Vehicle Count > Group Count {data-navmenu="Interviews QA_QC"}
+# Vehicle Count > Group Count {#qa-int-7 data-navmenu="Interviews QA_QC"}
+
 ```{r interview-qc7, echo=FALSE}
-wdfw_interview %>%
-  filter(event_date > '2020-01-01') %>%
-  drop_na(vehicle_count) %>%
-  mutate(
-    qc_7_interview = if_else(
-      vehicle_count <= total_group_count & !is.na(vehicle_count),
-      "Pass", "vehicle count > group count"
-    )
-  ) %>%
-  select(
-    event_date, project_name, fishery_name, water_body,
-    interview_number, vehicle_count, angler_count,
-    total_group_count, creel_event_id, qc_7_interview
-  ) %>%
-  filter(qc_7_interview == "vehicle count > group count") %>%
-  dt_dark()
+renderDT(dt_dark(qa_int_7()))
 ```
 
-# NA Previously Interviewed {data-navmenu="Interviews QA_QC"}
+# NA Previously Interviewed {#qa-int-8 data-navmenu="Interviews QA_QC"}
+
 ```{r interview-qc8, echo=FALSE}
-wdfw_interview %>%
-  filter(
-    event_date > '2022-01-01',
-    is.na(previously_interviewed)
-  ) %>%
-  mutate(qc_8_interview = "NA Previously Interviewed") %>%
-  select(
-    event_date, project_name, fishery_name, water_body,
-    interview_number, previously_interviewed, creel_event_id, qc_8_interview
-  ) %>%
-  dt_dark()
+renderDT(dt_dark(qa_int_8()))
 ```
 
-# NA Fishing Location {data-navmenu="Interviews QA_QC"}
+# NA Fishing Location {#qa-int-9 data-navmenu="Interviews QA_QC"}
+
 ```{r interview-qc9, echo=FALSE}
-wdfw_interview %>%
-  filter(
-    event_date > '2022-01-01',
-    is.na(fishing_location)
-  ) %>%
-  mutate(qc_9_interview = "NA Fishing Location") %>%
-  select(
-    event_date, project_name, fishery_name, water_body,
-    interview_number, fishing_location, creel_event_id, qc_9_interview
-  ) %>%
-  dt_dark()
+renderDT(dt_dark(qa_int_9()))
 ```
 
-# NA Fishery Name {data-navmenu="Interviews QA_QC"}
-```{r interview-na-fishery, echo=FALSE}
-wdfw_interview %>%
-  filter(
-    is.na(fishery_name),
-    event_date > '2022-01-01'
-  ) %>%
-  mutate(NA_fishery_name = "NA fishery name") %>%
-  select(
-    event_date, project_name, water_body, fishery_name,
-    creel_event_id, NA_fishery_name
-  ) %>%
-  distinct(creel_event_id, .keep_all = TRUE) %>%
-  dt_dark()
-```
+# Effort Count Sequence Check {#qa-eff-1 data-navmenu="Effort Count QA_QC"}
 
-# Effort Count Sequence Check {data-navmenu="Effort Count QA_QC"}
 ```{r effort-qc1, echo=FALSE}
-# Define mode function
-mode <- function(x) {
-  ux <- unique(x)
-  ux[which.max(tabulate(match(x, ux)))]
+renderDT(dt_dark(qa_eff_1()))
+```
+
+# Effort Start Time > End Time {#qa-eff-2 data-navmenu="Effort Count QA_QC"}
+
+```{r effort-qc2, echo=FALSE}
+renderDT(dt_dark(qa_eff_2()))
+```
+
+# Needs Proof Stamp {#qa-ce-proof data-navmenu="Creel Event QA_QC"}
+
+```{r proof-stamp, echo=FALSE}
+renderDT(dt_dark(qa_ce_proof()))
+```
+
+# NA Survey End Time {#qa-ce-end data-navmenu="Creel Event QA_QC"}
+
+```{r na-survey-end, echo=FALSE}
+renderDT(dt_dark(qa_ce_end()))
+```
+
+# Catch Table {data-navmenu="Summary"}
+
+```{r catch-summary, echo=FALSE}
+catch_group_table <- function(df, fn) {
+  d <- df %>%
+    filter(fishery_name == fn) %>%
+    mutate(
+      across(c(species, life_stage, fin_mark, fate), ~na_if(as.character(.x), "")),
+      across(c(species, life_stage, fin_mark, fate), ~replace_na(.x, "Not recorded")),
+      cwt_detection_status = replace_na(na_if(as.character(cwt_detection_status), ""),
+                                        "Not recorded")
+    )
+
+  cwt <- d %>%
+    group_by(species, life_stage, fin_mark, fate, cwt_detection_status) %>%
+    summarise(fish = sum(fish_count, na.rm = TRUE), .groups = "drop") %>%
+    mutate(catch_group = paste(species, life_stage, fin_mark, fate, sep = "_"))
+
+  grp <- cwt %>%
+    group_by(catch_group) %>%
+    summarise(
+      total_fish   = sum(fish),
+      n_cwt_status = n(),
+      cwt_status   = if (n() == 1) first(cwt_detection_status)
+                     else paste0(n(), " statuses (click row to expand)"),
+      .groups = "drop"
+    ) %>%
+    arrange(catch_group)
+
+  reactable(
+    grp,
+    filterable = TRUE,
+    outlined = TRUE, highlight = TRUE, resizable = TRUE,
+    defaultPageSize = 50, showPagination = TRUE, paginationType = "jump",
+    columns = list(
+      catch_group  = colDef(name = "Catch groups", minWidth = 220),
+      total_fish   = colDef(name = "Total fish", format = colFormat(separators = TRUE)),
+      cwt_status   = colDef(name = "CWT detection status"),
+      n_cwt_status = colDef(show = FALSE)
+    ),
+    details = function(index) {
+      if (grp$n_cwt_status[index] < 2) return(NULL)
+      sub <- cwt %>%
+        filter(catch_group == grp$catch_group[index]) %>%
+        select(`CWT detection status` = cwt_detection_status, Fish = fish) %>%
+        arrange(desc(Fish))
+      div(style = "padding: 8px 24px;",
+          reactable(sub, defaultPageSize = 50, outlined = TRUE, compact = TRUE,
+                    theme = dark_reactable_theme))
+    },
+    theme = dark_reactable_theme
+  )
 }
 
-wdfw_effort_count %>%
-  filter(tie_in_indicator == FALSE) %>%
-  group_by(project_name, fishery_name, section_num, event_date, location) %>%
-  summarise(max_cs = max(count_sequence), .groups = 'drop') %>%
-  left_join(
-    wdfw_effort_count %>%
-      filter(tie_in_indicator == FALSE) %>%
-      group_by(project_name, fishery_name, section_num, event_date, creel_event_id) %>%
-      summarise(mode_max_cs = mode(max(count_sequence)), .groups = 'drop'),
-    by = c("project_name", "fishery_name", "section_num", "event_date")
-  ) %>%
-  mutate(
-    effort_qc_2 = if_else(
-      max_cs < mode_max_cs,
-      "effort count sequence error", "pass"
-    )
-  ) %>%
-  filter(effort_qc_2 == "effort count sequence error") %>%
-  select(
-    event_date, project_name, fishery_name, section_num,
-    location, max_cs, mode_max_cs, creel_event_id, effort_qc_2
-  ) %>%
-  arrange(desc(event_date)) %>%
-  distinct(creel_event_id, .keep_all = TRUE) %>%
-  dt_dark()
+renderUI(selectInput("catch_tbl_fishery", "Fishery:", choices = req(sel_fisheries())))
+renderReactable(catch_group_table(wdfw_catch(), req(input$catch_tbl_fishery)))
 ```
 
-# Effort End Time > Start Time {data-navmenu="Effort Count QA_QC"}
-```{r effort-qc2, echo=FALSE}
-wdfw_effort_count %>%
-  mutate(
-    QC_2_effort = if_else(
-      effort_start_time > effort_end_time & !is.na(count_quantity),
-      "effort start time > effort end time", "Pass"
-    )
-  ) %>%
-  select(
-    event_date, project_name, fishery_name, water_body,
-    survey_type, location, count_type, effort_start_time,
-    effort_end_time, creel_event_id, QC_2_effort
-  ) %>%
-  filter(QC_2_effort == "effort start time > effort end time") %>%
-  dt_dark()
-```
+# Effort Table {data-navmenu="Summary"}
 
-# NA Fishery Name {data-navmenu="Effort Count QA_QC"}
-```{r effort-na-fishery, echo=FALSE}
-wdfw_effort_count %>%
-  filter(
-    event_date > '2022-01-01',
-    is.na(fishery_name)
-  ) %>%
-  mutate(NA_fishery_name = "NA Fishery Name") %>%
-  select(
-    event_date, project_name, water_body, survey_type, surveyor_num,
-    fishery_name, creel_event_id, NA_fishery_name
-  ) %>%
-  distinct(creel_event_id, .keep_all = TRUE) %>%
-  dt_dark()
-```
-
-# Needs Proof Stamp {data-navmenu="Creel Event QA_QC"}
-```{r proof-stamp, echo=FALSE}
-wdfw_creel_event %>%
-  filter(is.na(qaqc_datetime)) %>%
-  mutate(to_be_proofed = "Missing Proof") %>%
-  select(
-    event_date, project_name, water_body, start_time, end_time,
-    tie_in_indicator, comments_txt, qaqc_datetime,
-    creel_event_id, to_be_proofed
-  ) %>%
-  dt_dark()
-```
-
-# NA Survey End Time {data-navmenu="Creel Event QA_QC"}
-```{r na-survey-end, echo=FALSE}
-wdfw_creel_event %>%
-  filter(
-    event_date > '2020-01-01',
-    is.na(end_time)
-  ) %>%
-  mutate(NA_survey_end_time = "NA Survey End Time") %>%
-  select(
-    event_date, project_name, water_body,
-    start_time, end_time, creel_event_id, NA_survey_end_time
-  ) %>%
-  dt_dark()
-```
-
-# Catch Table 2022-23 {data-navmenu="Summary"}
-```{r catch-summary, echo=FALSE}
-wdfw_catch %>%
-  filter(event_date > "2022-01-01") %>%
-  group_by(
-    project_name, fishery_name, water_body, species,
-    fin_mark, cwt_detection_status, fate
-  ) %>%
-  summarise(total_recorded_catch = sum(fish_count, na.rm = TRUE), .groups = 'drop') %>%
-  reactable(
-    filterable = TRUE,
-    groupBy = c("project_name", "fishery_name", "water_body", "species", "fate"),
-    columns = list(
-      project_name = colDef(aggregate = "unique"),
-      total_recorded_catch = colDef(aggregate = "sum", format = colFormat(separators = TRUE))
-    ),
-    outlined = TRUE,
-    highlight = TRUE,
-    resizable = TRUE,
-    theme = reactableTheme(
-      color = "#ffffff",
-      backgroundColor = "#222222",
-      borderColor = "#444444",
-      stripedColor = "#2a2a2a",
-      highlightColor = "#333333",
-      inputStyle = list(backgroundColor = "#333333", color = "#ffffff"),
-      selectStyle = list(backgroundColor = "#333333", color = "#ffffff"),
-      pageButtonHoverStyle = list(backgroundColor = "#333333"),
-      pageButtonActiveStyle = list(backgroundColor = "#444444")
-    )
-  )
-```
-
-# Effort Table 2022-23 {data-navmenu="Summary"}
 ```{r effort-summary, echo=FALSE}
-wdfw_effort_count %>%
-  filter(event_date > "2022-01-01") %>%
-  group_by(
-    project_name, fishery_name, water_body, location,
-    survey_type, count_type
-  ) %>%
-  summarise(
-    total_vehicles_trailers_from_effort_counts = sum(count_quantity, na.rm = TRUE),
-    .groups = 'drop'
-  ) %>%
-  reactable(
-    filterable = TRUE,
-    groupBy = c("project_name", "fishery_name", "survey_type", "water_body", "location"),
-    columns = list(
-      project_name = colDef(aggregate = "unique"),
-      total_vehicles_trailers_from_effort_counts = colDef(
-        aggregate = "sum",
-        format = colFormat(separators = TRUE)
-      )
-    ),
-    outlined = TRUE,
-    highlight = TRUE,
-    resizable = TRUE,
-    theme = reactableTheme(
-      color = "#ffffff",
-      backgroundColor = "#222222",
-      borderColor = "#444444",
-      stripedColor = "#2a2a2a",
-      highlightColor = "#333333"
+renderReactable({
+  wdfw_effort_count() %>%
+    group_by(fishery_name, water_body, location, survey_type, count_type) %>%
+    summarise(
+      total_vehicles_trailers_from_effort_counts = sum(count_quantity, na.rm = TRUE),
+      .groups = 'drop'
+    ) %>%
+    reactable(
+      filterable = TRUE,
+      defaultPageSize = 50, showPagination = TRUE, paginationType = "jump",
+      groupBy = c("fishery_name", "survey_type", "water_body", "location"),
+      columns = list(
+        total_vehicles_trailers_from_effort_counts = colDef(
+          aggregate = "sum", format = colFormat(separators = TRUE)
+        )
+      ),
+      outlined = TRUE, highlight = TRUE, resizable = TRUE,
+      theme = dark_reactable_theme
     )
-  )
+})
 ```
 
-# Interview Table 2022-23 {data-navmenu="Summary"}
+# Interview Table {data-navmenu="Summary"}
+
 ```{r interview-summary, echo=FALSE}
-wdfw_interview %>%
-  filter(event_date > "2022-01-01") %>%
-  group_by(
-    project_name, fishery_name, water_body, fishing_location,
-    boat_used, boat_type
-  ) %>%
-  summarise(
-    total_angler_count_from_interviews = sum(angler_count, na.rm = TRUE),
-    .groups = 'drop'
-  ) %>%
-  reactable(
-    filterable = TRUE,
-    groupBy = c("project_name", "fishery_name", "water_body", "fishing_location", "boat_used"),
-    columns = list(
-      project_name = colDef(aggregate = "unique"),
-      total_angler_count_from_interviews = colDef(
-        aggregate = "sum",
-        format = colFormat(separators = TRUE)
-      )
-    ),
-    outlined = TRUE,
-    highlight = TRUE,
-    resizable = TRUE,
-    theme = reactableTheme(
-      color = "#ffffff",
-      backgroundColor = "#222222",
-      borderColor = "#444444",
-      stripedColor = "#2a2a2a",
-      highlightColor = "#333333"
+renderReactable({
+  wdfw_interview() %>%
+    group_by(fishery_name, water_body, fishing_location, boat_used, boat_type) %>%
+    summarise(
+      total_angler_count_from_interviews = sum(angler_count, na.rm = TRUE),
+      .groups = 'drop'
+    ) %>%
+    reactable(
+      filterable = TRUE,
+      defaultPageSize = 50, showPagination = TRUE, paginationType = "jump",
+      groupBy = c("fishery_name", "water_body", "fishing_location", "boat_used"),
+      columns = list(
+        total_angler_count_from_interviews = colDef(
+          aggregate = "sum", format = colFormat(separators = TRUE)
+        )
+      ),
+      outlined = TRUE, highlight = TRUE, resizable = TRUE,
+      theme = dark_reactable_theme
     )
-  )
+})
 ```
