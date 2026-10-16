@@ -40,10 +40,25 @@ clean_url <- function(x) {
   trimws(gsub("[][()\"'<> ]", "", x))
 }
 
+# Photo URLs: pull the first http(s) URL out of the text; keeps ( ) and other valid characters
+photo_url <- function(x) {
+  x <- as.character(x)
+  x <- gsub("\\[[^]]*\\]\\(([^)]*)\\)", "\\1", x)   # markdown [text](url) -> url
+  stringr::str_extract(x, "https?://[^\\s\"'<>]+")
+}
+
 # Open in the Windows default browser (not in R / RStudio)
 open_external <- function(url) {
   url <- clean_url(url)
   stopifnot(startsWith(url, CREEL_EVENT_URL))
+  if (.Platform$OS.type == "windows") shell.exec(url) else utils::browseURL(url)
+  invisible(NULL)
+}
+
+# Same, but for photo links (any http/https URL)
+open_photo_external <- function(url) {
+  url <- photo_url(url)
+  stopifnot(!is.na(url), grepl("^https?://", url))
   if (.Platform$OS.type == "windows") shell.exec(url) else utils::browseURL(url)
   invisible(NULL)
 }
@@ -72,6 +87,7 @@ theme_dark_custom <- function() {
 }
 theme_set(theme_dark_custom())
 
+# Species used by the Raw Catch Plots (Sockeye included)
 focal_species  <- c("Chinook", "Coho", "Pink", "Steelhead", "Chum", "Sockeye")
 recent_days_30 <- 30
 recent_days_60 <- 60
@@ -79,9 +95,8 @@ recent_days_60 <- 60
 
 ```{r database-connection, include=FALSE}
 con <- connect_creel_db()
-invisible(shiny::getDefaultReactiveDomain()$onSessionEnded(function() {
-  try(DBI::dbDisconnect(con), silent = TRUE)
-}))
+
+shiny::onStop(function() try(DBI::dbDisconnect(con), silent = TRUE))
 
 available_fisheries <- tryCatch({
   lut <- fishery_lut(conn = con)
@@ -132,29 +147,44 @@ process_datetime <- function(df) {
     )
 }
 
+# Make sure optional columns exist (as NA text) so select() never fails
+ensure_cols <- function(df, cols) {
+  for (nm in cols) if (!nm %in% names(df)) df[[nm]] <- NA_character_
+  df
+}
+
 wrangle_catch <- function(df) {
   df %>%
+    ensure_cols(c("comments", "image_url")) %>%
     select(
       event_date, water_body, fishery_name, project_name,
       species, run, sex, fate, fork_length_cm, fish_count,
       life_stage, fish_processing_status, fin_mark, cwt_detection_status,
       snout_code, cwt_read_status, cwt_code, cwt_species, cwt_run,
       scale_card_num, scale_card_pos, scale_age_code,
-      pit_detection_status, creel_event_id, interview_id, catch_id
+      pit_detection_status, comments, image_url,
+      creel_event_id, interview_id, catch_id
     ) %>%
     mutate(
-      fish_count = as.numeric(fish_count),
-      fork_length_cm = as.numeric(fork_length_cm)
+      fish_count     = as.numeric(fish_count),
+      fork_length_cm = as.numeric(fork_length_cm),
+      # Stray spaces (e.g. "Kept ") would make exact matches fail
+      species        = trimws(as.character(species)),
+      fate           = trimws(as.character(fate))
     ) %>%
     process_datetime()
 }
 
+# Accepts either comment_txt or comments_txt; exposes it as comment_txt
 wrangle_creel_event <- function(df) {
+  df <- df %>% rename(water_body = water_body_desc)
+  if (!"comment_txt" %in% names(df)) {
+    df$comment_txt <- if ("comments_txt" %in% names(df)) df$comments_txt else NA_character_
+  }
   df %>%
-    rename(water_body = water_body_desc) %>%
     select(
       event_date, water_body, project_name, start_time, end_time,
-      tie_in_indicator, comments_txt, qaqc_datetime, creel_event_id
+      tie_in_indicator, comment_txt, qaqc_datetime, creel_event_id
     ) %>%
     mutate(tie_in_indicator = as.numeric(tie_in_indicator)) %>%
     process_datetime()
@@ -162,12 +192,13 @@ wrangle_creel_event <- function(df) {
 
 wrangle_interview <- function(df) {
   df %>%
+    ensure_cols("comment_txt") %>%
     select(
       event_date, project_name, fishery_name, water_body, crc_area, fishing_location,
       section_num, survey_type, surveyor_num, interview_number, trip_status,
       previously_interviewed, angler_count, total_group_count, vehicle_count,
       trailer_count, boat_type, boat_used, fishing_start_time, fishing_end_time,
-      interview_time, creel_event_id, interview_id, location_id
+      interview_time, comment_txt, creel_event_id, interview_id, location_id
     ) %>%
     mutate(across(c(interview_number, total_group_count, vehicle_count,
                     trailer_count, angler_count), as.numeric)) %>%
@@ -205,6 +236,16 @@ observeEvent(input$open_url, {
     open_external(input$open_url),
     error = function(e) showNotification(
       paste("Could not open link:", conditionMessage(e)), type = "error", duration = 10)
+  )
+}, ignoreInit = TRUE)
+
+# Photo click -> default browser
+observeEvent(input$open_photo, {
+  req(is.character(input$open_photo), length(input$open_photo) == 1)
+  tryCatch(
+    open_photo_external(input$open_photo),
+    error = function(e) showNotification(
+      paste("Could not open photo link:", conditionMessage(e)), type = "error", duration = 10)
   )
 }, ignoreInit = TRUE)
 
@@ -274,6 +315,18 @@ blank_to_na <- function(df) {
   df %>% mutate(across(where(is.character), ~na_if(trimws(.x), "")))
 }
 
+# TRUE when a value has non-blank text
+has_text <- function(x) !is.na(x) & nzchar(trimws(as.character(x)))
+
+# count_type values used by the effort checks (exact spelling from the database)
+veh_types    <- c("Vehicles", "Vehicle Only")
+trl_types    <- c("Trailers", "Trailers Only")
+effort_types <- c(veh_types, trl_types)   # use veh_types in qa_eff_veh15 to flag vehicle rows only
+
+# Species included in the "Catch > 10" check
+gt10_species <- c("Coho", "Chinook", "Steelhead", "Chum", "Sockeye",
+                  "Dolly Varden", "Bull Trout", "Pink")
+
 # ---- Catch ----
 qa_um_chin <- reactive({
   blank_to_na(wdfw_catch()) %>%
@@ -337,6 +390,73 @@ qa_rel_bio <- reactive({
            species, fin_mark, fate, cwt_detection_status,
            scale_card_num, scale_card_pos, snout_code,
            creel_event_id, bio_flag)
+})
+
+# Catch > 10 (info) - listed species only
+qa_catch_gt10 <- reactive({
+  wdfw_catch() %>%
+    filter(!is.na(fish_count), fish_count > 10, species %in% gt10_species) %>%
+    mutate(catch_alert = "Catch > 10") %>%
+    select(catch_alert, event_date, project_name, fishery_name, water_body,
+           species, run, fate, fish_count, creel_event_id, interview_id, catch_id)
+})
+
+# Scale card errors (review). One check, with an error description per row.
+# Rules per scale_card_num: 5 digits; one species; positions exactly 1..n
+# (no duplicates, no gaps). Positions with no card number are also flagged.
+qa_scale_card <- reactive({
+  d <- blank_to_na(wdfw_catch()) %>%
+    mutate(card    = as.character(scale_card_num),
+           pos_txt = as.character(scale_card_pos),
+           pos     = suppressWarnings(as.numeric(pos_txt)),
+           sp      = as.character(species)) %>%
+    filter(!is.na(card) | !is.na(pos_txt))
+
+  bad_cards <- d %>%
+    filter(!is.na(card)) %>%
+    group_by(card) %>%
+    mutate(
+      e_digits = !grepl("^[0-9]{5}$", card),
+      e_spp    = anyNA(sp) || n_distinct(sp) != 1,
+      e_seq    = anyNA(pos) || !all(sort(pos) == seq_len(n())),
+      species_on_card   = paste(sort(unique(na.omit(sp))), collapse = " / "),
+      positions_on_card = paste(sort(pos), collapse = ",")
+    ) %>%
+    ungroup() %>%
+    filter(e_digits | e_spp | e_seq) %>%
+    mutate(scale_card_error = sub("; $", "", paste0(
+      if_else(e_digits, "Card # not 5 digits; ", ""),
+      if_else(e_spp,    "Mixed or missing species; ", ""),
+      if_else(e_seq,    "Positions not 1..n without gaps/duplicates; ", ""))))
+
+  orphans <- d %>%
+    filter(is.na(card)) %>%
+    mutate(scale_card_error = "Position with no card #",
+           species_on_card = NA_character_, positions_on_card = NA_character_)
+
+  bind_rows(bad_cards, orphans) %>%
+    arrange(card, pos) %>%
+    select(scale_card_error, scale_card_num, scale_card_pos, species,
+           species_on_card, positions_on_card,
+           event_date, project_name, fishery_name, water_body,
+           creel_event_id, interview_id, catch_id)
+})
+
+# Photos (info): image_url is turned into a clickable link in qaqc_prep()
+qa_photos <- reactive({
+  wdfw_catch() %>%
+    mutate(image_url = photo_url(image_url)) %>%
+    filter(!is.na(image_url)) %>%
+    select(event_date, project_name, fishery_name, water_body,
+           species, fate, image_url, creel_event_id, catch_id)
+})
+
+# Catch comments (info)
+qa_com_catch <- reactive({
+  wdfw_catch() %>%
+    filter(has_text(comments)) %>%
+    select(event_date, project_name, fishery_name, water_body,
+           species, fate, comments, creel_event_id, catch_id)
 })
 
 # ---- Interviews ----
@@ -436,6 +556,14 @@ qa_int_9 <- reactive({
            interview_number, fishing_location, creel_event_id, qc_9_interview)
 })
 
+# Interview comments (info)
+qa_com_int <- reactive({
+  wdfw_interview() %>%
+    filter(has_text(comment_txt)) %>%
+    select(event_date, project_name, fishery_name, water_body,
+           interview_number, comment_txt, creel_event_id, interview_id)
+})
+
 # ---- Effort ----
 qa_eff_1 <- reactive({
   wdfw_effort_count() %>%
@@ -462,13 +590,56 @@ qa_eff_2 <- reactive({
     filter(QC_2_effort == "effort start time > effort end time")
 })
 
+# Vehicles >15 (info). Census count types are ignored.
+qa_eff_veh15 <- reactive({
+  wdfw_effort_count() %>%
+    filter(count_type %in% effort_types,
+           !is.na(count_quantity), count_quantity > 15) %>%
+    mutate(effort_alert = "Vehicles >15") %>%
+    select(effort_alert, event_date, project_name, fishery_name, water_body,
+           location, survey_type, count_sequence, count_type, count_quantity,
+           creel_event_id, effort_event_id)
+})
+
+# More trailers than vehicles within an effort_event_id (info)
+qa_eff_trl <- reactive({
+  wdfw_effort_count() %>%
+    filter(count_type %in% effort_types, !is.na(effort_event_id)) %>%
+    group_by(effort_event_id) %>%
+    summarise(
+      event_date     = first(event_date),
+      project_name   = first(project_name),
+      fishery_name   = first(fishery_name),
+      water_body     = first(water_body),
+      location       = first(location),
+      count_sequence = first(count_sequence),
+      creel_event_id = first(creel_event_id),
+      vehicles = sum(count_quantity[count_type %in% veh_types], na.rm = TRUE),
+      trailers = sum(count_quantity[count_type %in% trl_types], na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    filter(trailers > vehicles) %>%
+    mutate(effort_alert = "More trailers than vehicles") %>%
+    select(effort_alert, event_date, project_name, fishery_name, water_body,
+           location, count_sequence, vehicles, trailers,
+           creel_event_id, effort_event_id)
+})
+
+# Effort comments (info)
+qa_com_eff <- reactive({
+  wdfw_effort_count() %>%
+    filter(has_text(comments)) %>%
+    select(event_date, project_name, fishery_name, water_body, location,
+           count_sequence, count_type, comments, creel_event_id, effort_event_id)
+})
+
 # ---- Creel event ----
 qa_ce_proof <- reactive({
   wdfw_creel_event() %>%
     filter(is.na(qaqc_datetime)) %>%
     mutate(to_be_proofed = "Missing Proof") %>%
     select(event_date, project_name, water_body, start_time, end_time,
-           tie_in_indicator, comments_txt, qaqc_datetime,
+           tie_in_indicator, comment_txt, qaqc_datetime,
            creel_event_id, to_be_proofed)
 })
 
@@ -480,6 +651,14 @@ qa_ce_end <- reactive({
            start_time, end_time, creel_event_id, NA_survey_end_time)
 })
 
+# Creel event comments (info)
+qa_com_ce <- reactive({
+  wdfw_creel_event() %>%
+    filter(has_text(comment_txt)) %>%
+    select(event_date, project_name, water_body, start_time, end_time,
+           comment_txt, creel_event_id)
+})
+
 # ---- Registry used by the summary page (page = the {#id} on each page header) ----
 # type = "review" (red/green) or "info" (blue, not counted as needing review)
 qa_checks <- list(
@@ -487,6 +666,7 @@ qa_checks <- list(
   list(group = "Catch",       type = "review", name = "Released fish with bio. samples",       page = "qa-rel-bio",      data = qa_rel_bio),
   list(group = "Catch",       type = "review", name = "CWT + (Beep) with NA snout code",       page = "qa-cwt-na-snout", data = qa_cwt_na_snout),
   list(group = "Catch",       type = "review", name = "CWT no (Beep) with snout code",         page = "qa-cwt-no-beep",  data = qa_cwt_no_beep),
+  list(group = "Catch",       type = "review", name = "Scale card errors",                     page = "qa-scale-card",   data = qa_scale_card),
   list(group = "Interview",   type = "review", name = "Incomplete trip with fishing end time", page = "qa-int-1",        data = qa_int_1),
   list(group = "Interview",   type = "review", name = "Missing trip status",                   page = "qa-int-2",        data = qa_int_2),
   list(group = "Interview",   type = "review", name = "Fishing end time > interview time",     page = "qa-int-3",        data = qa_int_3),
@@ -500,7 +680,15 @@ qa_checks <- list(
   list(group = "Creel event", type = "review", name = "Needs proof stamp",                     page = "qa-ce-proof",     data = qa_ce_proof),
   list(group = "Creel event", type = "review", name = "NA survey end time",                    page = "qa-ce-end",       data = qa_ce_end),
   list(group = "Info",        type = "info",   name = "All CWT + (Beep)",                      page = "qa-cwt-beep",     data = qa_cwt_beep),
-  list(group = "Info",        type = "info",   name = "NA previously interviewed",             page = "qa-int-8",        data = qa_int_8)
+  list(group = "Info",        type = "info",   name = "NA previously interviewed",             page = "qa-int-8",        data = qa_int_8),
+  list(group = "Catch",       type = "info",   name = "Catch > 10",                            page = "qa-catch-gt10",   data = qa_catch_gt10),
+  list(group = "Catch",       type = "info",   name = "Photos",                                page = "qa-photos",       data = qa_photos),
+  list(group = "Catch",       type = "info",   name = "Comments",                              page = "qa-com-catch",    data = qa_com_catch),
+  list(group = "Interview",   type = "info",   name = "Comments",                              page = "qa-com-int",      data = qa_com_int),
+  list(group = "Effort",      type = "info",   name = "Vehicles >15",                          page = "qa-eff-veh15",    data = qa_eff_veh15),
+  list(group = "Effort",      type = "info",   name = "More trailers than vehicles",           page = "qa-eff-trl",      data = qa_eff_trl),
+  list(group = "Effort",      type = "info",   name = "Comments",                              page = "qa-com-eff",      data = qa_com_eff),
+  list(group = "Creel event", type = "info",   name = "Comments",                              page = "qa-com-ce",       data = qa_com_ce)
 )
 
 qa_summary <- reactive({
@@ -531,6 +719,16 @@ latest_date <- function(df) {
   max(d, na.rm = TRUE)
 }
 
+# Keep only the last `days_back` days of each fishery, measured from THAT fishery's
+# own latest date (so a fishery with later dates can't push another one out of the window)
+recent_by_fishery <- function(df, days_back) {
+  df %>%
+    filter(!is.na(event_date)) %>%
+    group_by(fishery_name) %>%
+    filter(event_date >= max(event_date, na.rm = TRUE) - days(days_back)) %>%
+    ungroup()
+}
+
 daily_x <- function() list(
   scale_x_date(date_breaks = "1 day", date_labels = "%m/%d", expand = expansion(add = 1)),
   theme(axis.text.x = element_text(angle = 90, vjust = 0.5, size = 7))
@@ -558,10 +756,12 @@ create_catch_plot <- function(data, title_text = "", facet_var = NULL) {
   ggplotly(p) %>% layout(plotly_dark_theme)
 }
 
+# Fixed bar width (0.8 day) so sparse dates don't produce bars spanning several days
 create_bar_plot <- function(data, title_text = "", facet_var = NULL) {
   p <- data %>%
+    mutate(fate = factor(fate, levels = c("Kept", "Released"))) %>%
     ggplot(aes(x = event_date, y = total_catch, fill = fate)) +
-    geom_bar(position = "stack", stat = "identity") +
+    geom_col(position = "stack", width = 0.8) +
     scale_fill_manual(values = c("Kept" = "#ff6b6b", "Released" = "#4ecdc4")) +
     theme_dark_custom() +
     labs(x = NULL, y = "Total Catch", fill = NULL, subtitle = title_text) +
@@ -621,22 +821,32 @@ create_comparison_plot <- function(cur, prev, fishery, prev_name) {
     layout(plotly_dark_theme, margin = list(l = 80, r = 100, b = 70, t = 60))
 }
 
-# creel_event_id -> clickable link; click is sent to R, which opens the default browser
-qaqc_prep <- function(df) {
-  if ("event_date" %in% names(df)) df <- df %>% arrange(desc(event_date), desc(creel_event_id))
+# creel_event_id -> clickable link; image_url -> clickable "View photo" link.
+# Clicks are sent to R, which opens the default browser.
+# sort = FALSE keeps the check's own row order (used by Scale card errors).
+qaqc_prep <- function(df, sort = TRUE) {
+  if (sort && "event_date" %in% names(df)) df <- df %>% arrange(desc(event_date), desc(creel_event_id))
   if ("creel_event_id" %in% names(df)) {
     df <- df %>% mutate(creel_event_id = as.character(creel_event_id),
       creel_event_id = if_else(is.na(creel_event_id), NA_character_,
         sprintf('<a href="#" class="creel-link" data-url="%s%s" style="color:#64b5f6; text-decoration:underline;">%s</a>',
                 CREEL_EVENT_URL, creel_event_id, creel_event_id)))
   }
+  if ("image_url" %in% names(df)) {
+    df <- df %>% mutate(image_url = photo_url(image_url),
+      image_url = if_else(is.na(image_url), NA_character_,
+        sprintf('<a href="#" class="photo-link" data-url="%s" style="color:#64b5f6; text-decoration:underline;">View photo</a>',
+                htmltools::htmlEscape(image_url, attribute = TRUE))))
+  }
   df
 }
 
-dt_dark <- function(data) {
-  data <- qaqc_prep(data)
-  esc <- if ("creel_event_id" %in% names(data)) {
-    which(names(data) != "creel_event_id")
+dt_dark <- function(data, sort = TRUE) {
+  data <- qaqc_prep(data, sort = sort)
+  # Only the link columns are left unescaped; comments and other text stay escaped
+  html_cols <- c("creel_event_id", "image_url")
+  esc <- if (any(names(data) %in% html_cols)) {
+    which(!names(data) %in% html_cols)
   } else TRUE
   datatable(
     data,
@@ -704,6 +914,13 @@ $(document)
   .on('click.fishcheck', 'a.creel-link', function(e) {
     e.preventDefault();
     Shiny.setInputValue('open_url', $(this).attr('data-url'), {priority: 'event'});
+  });
+
+$(document)
+  .off('click.fishphoto', 'a.photo-link')
+  .on('click.fishphoto', 'a.photo-link', function(e) {
+    e.preventDefault();
+    Shiny.setInputValue('open_photo', $(this).attr('data-url'), {priority: 'event'});
   });
 
 // Jump to a dashboard page by its {#id}
@@ -778,14 +995,14 @@ renderReactable({
 
 ```{r last-30-days, echo=FALSE}
 renderPlotly({
-  d <- wdfw_catch()
-  d %>%
-    uncount(fish_count) %>%
+  wdfw_catch() %>%
+    recent_by_fishery(recent_days_30) %>%
     filter(
-      event_date >= latest_date(d) - days(recent_days_30),
       fate %in% c("Kept", "Released"),
-      species %in% focal_species
+      species %in% focal_species,
+      !is.na(fish_count), fish_count > 0
     ) %>%
+    uncount(fish_count) %>%
     create_catch_plot(paste0("WDFW Creel Recorded Catch - Last ", recent_days_30,
                              " Days of Selected Fisheries"), "fishery_name")
 })
@@ -795,10 +1012,9 @@ renderPlotly({
 
 ```{r daily-steelhead, echo=FALSE}
 renderPlotly({
-  d <- wdfw_catch()
-  d %>%
+  wdfw_catch() %>%
+    recent_by_fishery(recent_days_60) %>%
     filter(
-      event_date >= latest_date(d) - days(recent_days_60),
       fate %in% c("Kept", "Released"),
       species == "Steelhead"
     ) %>%
@@ -812,10 +1028,9 @@ renderPlotly({
 
 ```{r daily-chinook, echo=FALSE}
 renderPlotly({
-  d <- wdfw_catch()
-  d %>%
+  wdfw_catch() %>%
+    recent_by_fishery(recent_days_60) %>%
     filter(
-      event_date >= latest_date(d) - days(recent_days_60),
       fate %in% c("Kept", "Released"),
       species == "Chinook"
     ) %>%
@@ -958,6 +1173,30 @@ renderDT(dt_dark(qa_cwt_no_beep()))
 renderDT(dt_dark(qa_rel_bio()))
 ```
 
+# Catch > 10 {#qa-catch-gt10 data-navmenu="Catch QA_QC"}
+
+```{r catch-gt10, echo=FALSE}
+renderDT(dt_dark(qa_catch_gt10()))
+```
+
+# Scale Card Errors {#qa-scale-card data-navmenu="Catch QA_QC"}
+
+```{r scale-card, echo=FALSE}
+renderDT(dt_dark(qa_scale_card(), sort = FALSE))
+```
+
+# Photos {#qa-photos data-navmenu="Catch QA_QC"}
+
+```{r photos, echo=FALSE}
+renderDT(dt_dark(qa_photos()))
+```
+
+# Catch Comments {#qa-com-catch data-navmenu="Catch QA_QC"}
+
+```{r catch-comments, echo=FALSE}
+renderDT(dt_dark(qa_com_catch()))
+```
+
 # Incomplete Trip Status with Fishing End Time {#qa-int-1 data-navmenu="Interviews QA_QC"}
 
 ```{r interview-qc1, echo=FALSE}
@@ -1012,6 +1251,12 @@ renderDT(dt_dark(qa_int_8()))
 renderDT(dt_dark(qa_int_9()))
 ```
 
+# Interview Comments {#qa-com-int data-navmenu="Interviews QA_QC"}
+
+```{r interview-comments, echo=FALSE}
+renderDT(dt_dark(qa_com_int()))
+```
+
 # Effort Count Sequence Check {#qa-eff-1 data-navmenu="Effort Count QA_QC"}
 
 ```{r effort-qc1, echo=FALSE}
@@ -1024,6 +1269,24 @@ renderDT(dt_dark(qa_eff_1()))
 renderDT(dt_dark(qa_eff_2()))
 ```
 
+# Vehicles >15 {#qa-eff-veh15 data-navmenu="Effort Count QA_QC"}
+
+```{r effort-veh15, echo=FALSE}
+renderDT(dt_dark(qa_eff_veh15()))
+```
+
+# More Trailers Than Vehicles {#qa-eff-trl data-navmenu="Effort Count QA_QC"}
+
+```{r effort-trailers, echo=FALSE}
+renderDT(dt_dark(qa_eff_trl()))
+```
+
+# Effort Comments {#qa-com-eff data-navmenu="Effort Count QA_QC"}
+
+```{r effort-comments, echo=FALSE}
+renderDT(dt_dark(qa_com_eff()))
+```
+
 # Needs Proof Stamp {#qa-ce-proof data-navmenu="Creel Event QA_QC"}
 
 ```{r proof-stamp, echo=FALSE}
@@ -1034,6 +1297,12 @@ renderDT(dt_dark(qa_ce_proof()))
 
 ```{r na-survey-end, echo=FALSE}
 renderDT(dt_dark(qa_ce_end()))
+```
+
+# Creel Event Comments {#qa-com-ce data-navmenu="Creel Event QA_QC"}
+
+```{r creel-event-comments, echo=FALSE}
+renderDT(dt_dark(qa_com_ce()))
 ```
 
 # Catch Table {data-navmenu="Summary"}
